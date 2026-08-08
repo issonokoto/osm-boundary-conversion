@@ -31,7 +31,7 @@ Use Overpass or the OSM API when the task needs tagged-element discovery, a clos
 
 Use the direct Nominatim/OSM HTTP endpoints for this workflow. Do not use generic web search, browser page scraping, or a search result page to reach an OSM API endpoint; those add latency and make the request harder to bound.
 
-Typical tags to inspect include `type=multipolygon`, `boundary=administrative`, `natural=coastline`, `natural=water`, `water=lake`, `place=island`, `leisure=park`, and the feature's local name tags. Tags are evidence, not a substitute for checking the actual geometry and intended definition.
+Typical tags to inspect include `type=multipolygon`, `boundary=administrative`, `natural=coastline`, `natural=water`, `water=lake`, `type=strait`, `place=island`, `leisure=park`, and the feature's local name tags. Tags are evidence, not a substitute for checking the actual geometry and intended definition.
 
 The bundled converter recognizes both administrative and natural-feature candidates. Use `--kind administrative-area`, `--kind island`, `--kind water`, or `--kind park` when the intended boundary is known. Without `--kind`, it infers a supported kind from the Nominatim category/type and still stops on tied candidates instead of choosing the first same-name result.
 
@@ -72,7 +72,7 @@ Accept only a candidate that passes the checks. Store the stable `osmType` and `
 
 ### 4. Fetch and normalize complete geometry
 
-For a relation, fetch the full relation and its members, preserve `outer` and `inner` roles, and reconstruct the multipolygon from complete ways. For a closed way, confirm that the first and last coordinates match. Never use a bounding box or a simplified search preview as the final boundary.
+For a relation, fetch the full relation and its members, preserve `outer` and `inner` roles, and reconstruct the multipolygon from complete ways. For a way, require a closed polygon with matching first and last node IDs; never auto-close a linear feature such as a named strait. A recognized water feature may still be line-only and therefore unsuitable for an area mask. Never use a bounding box or a simplified search preview as the final boundary.
 
 Normalize all coordinates to GeoJSON order `[longitude, latitude]`. Handle antimeridian crossings deliberately, preserve holes, remove only exact duplicate consecutive points, and keep enough vertices for the intended scale. Do not simplify before the unsimplified geometry has been saved or checksummed.
 
@@ -164,6 +164,7 @@ Return a compact receipt containing the accepted OSM object, rejected or ambiguo
 
 - **Same-name wrong object:** repeat with context, coordinates, aliases, and explicit OSM IDs; reject the result instead of accepting the first polygon.
 - **Water or island is not recognized:** check the Nominatim `category`/`type` (`water`/`lake`, `place`/`island`) and retry with `--kind water` or `--kind island`; do not require `boundary=administrative` for natural features.
+- **Named water feature is a line:** keep the `natural=strait`/other linear OSM object as a water feature, but reject it for polygon conversion unless a closed area relation/way is separately verified; never turn an open way into a fake triangle by adding its first point.
 - **Island includes a country or territorial water:** inspect tags and area definition, compare the shape with a trusted reference, and choose a landmass relation or documented alternate source.
 - **Lake or park is missing or split:** query `natural=water`, `water=*`, relation members, and nearby coordinates; keep separate features separate unless the requested definition is a group boundary.
 - **Relation/API timeout:** retry a bounded endpoint/query with backoff, then document a fallback; do not silently replace the source.
