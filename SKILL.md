@@ -43,6 +43,15 @@ Use three execution modes:
 
 For a new name-based request, use a total network budget of roughly 45 seconds: one discovery request and one full-object request, with at most one bounded retry for a transient failure. Once an ID is fixed, never repeat discovery for the same run.
 
+When this skill folder contains `scripts/convert_osm_boundary.mjs`, use that bundled converter first instead of writing a new boundary-assembly script. Typical commands are:
+
+```text
+node scripts/convert_osm_boundary.mjs --name "豊中市" --context "大阪府 日本" --output-dir outputs
+node scripts/convert_osm_boundary.mjs --osm-type relation --osm-id 358672 --name "豊中市" --output-dir outputs
+```
+
+The bundled converter performs the bounded HTTP requests, relation/way assembly, GeoJSON save, metadata save, and aspect-preserving SVG specification. Use `--deep` only when deeper checks are requested or the quick result is ambiguous; do not reimplement its core algorithm in the task workspace.
+
 ### 3. Select and pin the correct OSM object
 
 Compare every viable candidate on all of the following:
