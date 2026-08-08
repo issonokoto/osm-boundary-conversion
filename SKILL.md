@@ -31,6 +31,8 @@ Use Overpass or the OSM API when the task needs tagged-element discovery, a clos
 
 Typical tags to inspect include `type=multipolygon`, `boundary=administrative`, `natural=coastline`, `natural=water`, `water=lake`, `place=island`, `leisure=park`, and the feature's local name tags. Tags are evidence, not a substitute for checking the actual geometry and intended definition.
 
+Use a fast path when a verified `osmType` and `osmId` are already available: skip Nominatim name search, fetch the complete pinned object once, and validate the result locally. Treat alternate geometries such as Geolonia, Natural Earth, or WDPA as optional comparisons, not required steps on every run. Put a bounded timeout on network requests, avoid unbounded retry/sleep loops, and reuse a local response cache when the source revision has not changed.
+
 ### 3. Select and pin the correct OSM object
 
 Compare every viable candidate on all of the following:
@@ -67,6 +69,8 @@ Run checks appropriate to the feature and output scale:
 - visual overlay or rendered preview at the target scale.
 
 For global features, do not calculate area with a flat longitude/latitude shoelace formula without accounting for projection and antimeridian behavior. A large area mismatch is a signal to revisit the candidate and definition, not something to hide by changing metadata.
+
+Keep ratio meanings separate. `areaRatio = geometryArea / referenceArea` and `areaDifferencePercent` describe area agreement; they do not describe an image's shape. For an image, record at least `coordinateBboxAspectRatio = longitudeSpan / latitudeSpan`, `projectedAspectRatio = longitudeSpan * cos(centerLatitude) / latitudeSpan`, and the actual canvas ratio. Never answer a visual "比率" question with an area ratio.
 
 ### 6. Save a canonical, reproducible data record
 
@@ -111,6 +115,8 @@ Treat GeoJSON or another validated vector as canonical; never make a screenshot 
 
 Render a preview and inspect it for flipped latitude, cropped edges, missing holes, antimeridian seams, disconnected pieces, and geometry extending outside the expected bounds. Keep vector and raster filenames/version identifiers linked.
 
+For aspect-preserving output, use one projected x/y scale and derive dimensions from the projected ratio. Make the SVG canvas ratio agree with the projected content ratio within rounding tolerance. If a square canvas is explicitly required, letterbox or pad it while keeping one scale; never map longitude and latitude independently to the full square. Derive raster dimensions from the same ratio, for example a projected ratio of `1.3919` with a long edge of `2048` becomes approximately `2048×1471`, not `2048×2048`.
+
 ### 8. Report provenance and hand off
 
 Return a compact receipt containing the accepted OSM object, rejected or ambiguous candidates, source URLs and retrieval time, boundary definition, validation results, output paths, export settings, and any fallback or manual correction. If publication is requested, stage only the reviewed files, preserve unrelated worktree changes, and verify the remote raw files and live site separately from local validation.
@@ -120,9 +126,11 @@ Return a compact receipt containing the accepted OSM object, rejected or ambiguo
 - Prefer an explicit verified OSM ID over a fresh name search.
 - Prefer full OSM relation/member geometry over a Nominatim preview for the final vector.
 - Use area as a plausibility check, never as the sole identity criterion.
+- When an explicit ID is pinned, do not repeat discovery or unrelated reference downloads during ordinary regeneration.
 - Distinguish natural land, water surface, administrative territory, protected-area designation, and facility footprint; they are not interchangeable.
 - Use Natural Earth, WDPA, or another source only as a declared fallback or composite source, with its own attribution and metadata.
 - Save vector first, then rasterize or convert; preserve the conversion settings.
+- Report area ratio, coordinate-bbox ratio, projected content ratio, and canvas ratio as separate named values.
 - Do not delete an old geometry or overwrite a raw cache until the replacement, catalog references, and rendered preview have passed validation.
 
 ## Failure handling
@@ -132,6 +140,8 @@ Return a compact receipt containing the accepted OSM object, rejected or ambiguo
 - **Lake or park is missing or split:** query `natural=water`, `water=*`, relation members, and nearby coordinates; keep separate features separate unless the requested definition is a group boundary.
 - **Relation/API timeout:** retry a bounded endpoint/query with backoff, then document a fallback; do not silently replace the source.
 - **Geometry looks plausible but renders wrong:** check `[lon, lat]` order, ring closure, projection, y-axis direction, antimeridian handling, and hole winding before changing the data.
+- **The output is square or too narrow:** inspect the actual SVG `width`, `height`, and `viewBox`, then compare canvas ratio with projected content ratio; remove independent x/y normalization and recompute raster dimensions from one projected scale.
+- **A ratio answer seems contradictory:** label whether it is area, coordinate-bbox, projected-content, or canvas ratio before making a conclusion.
 - **Simplification changes the result:** reduce tolerance or retain the detailed geometry and generate a scale-specific derivative; record the measured area ratio.
 - **Attribution is missing:** stop the export handoff and restore OSM/ODbL or alternate-source attribution in the data and receipt.
 
