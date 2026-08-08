@@ -39,11 +39,11 @@ Use a fast path when a verified `osmType` and `osmId` are already available: ski
 
 Use three execution modes:
 
-- **Quick (default):** one Nominatim discovery request when no ID is supplied, one complete OSM object request, local geometry checks, and canonical GeoJSON plus metadata and SVG/export specifications.
+- **Quick (default):** one Nominatim discovery request when no ID is supplied, one complete OSM object request, local geometry checks, and canonical GeoJSON plus metadata and SVG/export specifications. Quick mode is a hard stop: do not open web search, query an official-area page, compare Natural Earth/WDPA, request a second candidate, run `--deep`, render a PNG, or repeat a successful request. Do not add `--keep-raw` unless raw reproducibility was requested; save the result as soon as the local checks pass.
 - **Deep (opt-in):** official-area lookup, alternate-source comparison, PNG preview, or visual inspection only when the user requests it, the quick checks are ambiguous, or the feature is unusually complex.
 - **Fallback:** if a bounded request fails or exceeds its timeout, stop that request, report the exact stage, and use a documented alternate source only when appropriate. Do not silently start a long chain of retries.
 
-For a new name-based request, use a total network budget of roughly 45 seconds: one discovery request and one full-object request, with at most one bounded retry for a transient failure. Once an ID is fixed, never repeat discovery for the same run. Do not hardcode a city, island, water body, OSM ID, area, or special-case correction into the workflow; the same candidate, context, kind, and geometry checks must work for any place.
+For a new name-based request, target completion within roughly 10 seconds and hard-stop the two-request network budget at 30 seconds: one discovery request and one full-object request, with at most one bounded retry only for a transient failure. Once an ID is fixed, never repeat discovery for the same run. On a repeat run, pass `--reuse-cache`; the bundled converter reuses the pinned target, discovery response, and full OSM response without contacting Nominatim again. Do not hardcode a city, island, water body, OSM ID, area, or special-case correction into the workflow; the same candidate, context, kind, and geometry checks must work for any place.
 
 When this skill folder contains `scripts/convert_osm_boundary.mjs`, use that bundled converter first instead of writing a new boundary-assembly script. Typical commands are:
 
@@ -54,10 +54,11 @@ node scripts/convert_osm_boundary.mjs --name "淡路島" --kind island --context
 node scripts/convert_osm_boundary.mjs --name "琵琶湖" --kind water --context "滋賀県 日本" --output-dir outputs
 node scripts/convert_osm_boundary.mjs --name "明石海峡" --kind water --context "兵庫県 日本" --output-dir outputs
 node scripts/convert_osm_boundary.mjs --osm-type way --osm-id 1442885134 --name "明石海峡" --kind water --output-dir outputs
+node scripts/convert_osm_boundary.mjs --name "姫路市" --kind administrative-area --context "兵庫県 日本" --output-dir outputs --reuse-cache
 node scripts/convert_osm_boundary.mjs --osm-type relation --osm-id 358672 --output-dir outputs --reuse-cache
 ```
 
-The bundled converter performs the bounded HTTP requests, relation/way assembly, GeoJSON save, metadata save, and aspect-preserving SVG/export specification. `--reuse-cache` reuses a previously saved full OSM response for same-ID regeneration; omit it when a fresh source revision is required. Use `--deep` only when deeper checks are requested or the quick result is ambiguous; do not reimplement its core algorithm in the task workspace. A closed way or relation becomes a `Polygon`/`MultiPolygon`; an open way is preserved as a `LineString` with a line preview and an explicit `pngMask.supported=false` record. It is never silently closed into an invented area.
+The bundled converter performs the bounded HTTP requests, relation/way assembly, GeoJSON save, metadata save, and aspect-preserving SVG/export specification. It stores a small discovery cache and, with `--reuse-cache`, reuses the pinned target, discovery response, and full OSM response for same-request regeneration. Omit `--reuse-cache` when a fresh source revision is required. Use `--deep` only when deeper checks are requested or the quick result is ambiguous; do not reimplement its core algorithm in the task workspace. A closed way or relation becomes a `Polygon`/`MultiPolygon`; an open way is preserved as a `LineString` with a line preview and an explicit `pngMask.supported=false` record. It is never silently closed into an invented area.
 
 When a request names several nearby features, create one target entry per intended feature (name, kind, context, and optional verified OSM ID), resolve and save each independently, and write a small manifest linking the entries. Keep the city/administrative area, each island, and each water feature as separate objects unless the user explicitly requests a union. A failed or rejected candidate must remain visible in the manifest; do not silently substitute a same-name feature or merge a surrounding water body into a land boundary.
 
@@ -183,6 +184,8 @@ Return a compact receipt containing the accepted OSM object, rejected or ambiguo
 
 - Prefer an existing reusable converter or one compact deterministic helper. Do not build a long bespoke reconstruction, rasterization, and audit script in several exploratory stages when the canonical OSM response can be processed directly.
 - After one successful fetch and one successful local validation, save the outputs and report them. Do not fetch the same relation again solely to recalculate a hash, redraw a preview, or repeat a check already recorded in metadata.
+- Do not copy the bundled converter into multiple temporary locations or retry the same path/runtime error in a loop. A skill-path or sandbox permission error is an execution-environment issue: report it once, use the approved workspace runtime/permission path, and continue with the single bounded request.
+- Do not turn a Quick request into a research workflow because an area reference is absent. Save `referenceAreaKm2: null` and state that the optional comparison was not requested.
 - If a required step is still running after its budget, stop and report the stage and elapsed time; do not continue silently or ask the user to wait without a concrete diagnostic.
 
 ## Final checklist
