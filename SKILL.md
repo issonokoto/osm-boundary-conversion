@@ -1,0 +1,147 @@
+---
+name: osm-boundary-conversion
+description: Resolve and verify OSM-derived boundaries for islands, lakes, parks, administrative areas, and site footprints, then preserve canonical GeoJSON plus metadata and export-ready specifications for SVG, PNG masks, raster tiles, KML, or other image/data outputs. Use when a boundary must be selected from OSM, Nominatim, or Overpass, reconstructed from relations, checked against place/area/context, converted, or saved into a project catalog.
+---
+
+# OSM Boundary Conversion
+
+## Purpose
+
+Use a verified vector boundary as the source of truth and derive images or other formats from it. Keep the source identity, boundary meaning, geometry checks, and export transform together so the result can be reproduced later.
+
+## Workflow
+
+### 1. Define what the boundary means
+
+Before querying OSM, record:
+
+- target feature and aliases;
+- boundary kind: island/landmass, lake or water surface, park, administrative area, facility footprint, or another explicitly named concept;
+- whether surrounding water, territorial waters, enclaves, islands, and holes are included;
+- geographic context and an expected order of magnitude for area;
+- required output formats, coordinate reference system, image dimensions, and whether exact georeferencing is required.
+
+If the request does not distinguish a natural feature from an administrative boundary, keep both as candidates and state the choice. Do not silently use whichever same-name result appears first.
+
+### 2. Discover candidates
+
+Use Nominatim for human-readable candidate discovery and quick polygon inspection. Request polygon geometry only when it is useful, and retain the returned `osm_type`, `osm_id`, display name, tags, address context, and query. Use `lookup` with an explicit OSM reference once an ID is known.
+
+Use Overpass or the OSM API when the task needs tagged-element discovery, a closed way, or complete relation members and geometry. Query by name plus context, coordinates, or relevant tags; do not treat a name-only match as proof of identity. Respect public-service rate limits, send a descriptive User-Agent, cache responses, and retry transient errors with backoff.
+
+Typical tags to inspect include `type=multipolygon`, `boundary=administrative`, `natural=coastline`, `natural=water`, `water=lake`, `place=island`, `leisure=park`, and the feature's local name tags. Tags are evidence, not a substitute for checking the actual geometry and intended definition.
+
+### 3. Select and pin the correct OSM object
+
+Compare every viable candidate on all of the following:
+
+1. exact or alias name and language tags;
+2. country, prefecture, municipality, or nearby landmark context;
+3. tags and object type appropriate to the requested boundary;
+4. centroid and bounding box;
+5. polygon or multipolygon shape, including holes and disconnected parts;
+6. rough area and plausibility against an official or trusted reference.
+
+Accept only a candidate that passes the checks. Store the stable `osmType` and `osmId` (for example, `relation:123` or `way:456`) with the output. If no candidate passes, report the ambiguity and request a better identifier or use an explicitly documented alternate source.
+
+### 4. Fetch and normalize complete geometry
+
+For a relation, fetch the full relation and its members, preserve `outer` and `inner` roles, and reconstruct the multipolygon from complete ways. For a closed way, confirm that the first and last coordinates match. Never use a bounding box or a simplified search preview as the final boundary.
+
+Normalize all coordinates to GeoJSON order `[longitude, latitude]`. Handle antimeridian crossings deliberately, preserve holes, remove only exact duplicate consecutive points, and keep enough vertices for the intended scale. Do not simplify before the unsimplified geometry has been saved or checksummed.
+
+For large or complex relations that time out or return an unusable polygon, try a bounded alternate OSM endpoint or a smaller, explicitly scoped query. If OSM remains unusable, a source such as Natural Earth or WDPA may be used only as a documented fallback; record the reason, source identity, and changed boundary definition, and never label the fallback as OSM geometry.
+
+### 5. Validate before saving derivatives
+
+Run checks appropriate to the feature and output scale:
+
+- valid JSON and GeoJSON structure;
+- `Polygon` or `MultiPolygon` geometry with non-empty, closed rings;
+- correct outer/inner winding or library-normalized winding;
+- no self-intersections, broken relation joins, accidental duplicate rings, or holes outside their outer ring;
+- plausible bounding box, centroid, and coordinate range;
+- geodesic or equal-area projected area, with holes subtracted;
+- comparison with official/reference area and the intended boundary meaning;
+- area preservation after any simplification, with a stated tolerance;
+- visual overlay or rendered preview at the target scale.
+
+For global features, do not calculate area with a flat longitude/latitude shoelace formula without accounting for projection and antimeridian behavior. A large area mismatch is a signal to revisit the candidate and definition, not something to hide by changing metadata.
+
+### 6. Save a canonical, reproducible data record
+
+Save the canonical vector feature first. Prefer one detailed geometry file plus a lightweight catalog entry when a project has a catalog/detail split. Use stable names based on the pinned source ID, such as `R123.geojson` for a relation and `W456.geojson` for a way, unless the host project has a stronger naming convention.
+
+At minimum, preserve these properties alongside the geometry:
+
+```json
+{
+  "id": "stable-project-id",
+  "name": "display name",
+  "kind": "island",
+  "context": "country or regional context",
+  "aliases": ["alternate name"],
+  "osmType": "relation",
+  "osmId": 123,
+  "boundaryDefinition": "land area excluding surrounding water",
+  "boundarySourceLabel": "OpenStreetMap",
+  "boundarySourceUrl": "https://www.openstreetmap.org/relation/123",
+  "sourceQuery": "name and context used for discovery",
+  "fetchedAt": "ISO-8601 timestamp",
+  "geometryAreaKm2": 0,
+  "officialAreaKm2": null,
+  "geometryFile": "path/to/detail.geojson",
+  "coordinateSystem": "WGS84 / EPSG:4326",
+  "license": "OpenStreetMap contributors, ODbL"
+}
+```
+
+Add `geometryAreaKm2`, `bbox`, validation status, simplification tolerance, and reference-area source when available. Preserve raw API responses or a checksum in a research cache when reproducibility matters, but keep large caches out of the public catalog unless they are intentionally part of the project.
+
+For Dokodemo Nauru, inspect the current nested `github-dokodemo-nauru` repository before writing. The established pattern is a catalog under `data/` with detailed files under a feature-specific directory, metadata such as `osmType`, `osmId`, `geometryFile`, and source attribution, and local audit scripts under `scripts/`. Re-check current paths and schema rather than assuming an old revision is unchanged.
+
+### 7. Derive image and other outputs from the vector
+
+Treat GeoJSON or another validated vector as canonical; never make a screenshot the only saved boundary. For each derivative, save the transform specification with the output:
+
+- **SVG:** choose a projection or planar transform, map the target bounds to the viewBox, preserve holes as subpaths, and document whether y-axis inversion was applied.
+- **PNG/TIFF mask:** choose width, height, bounds, background, fill/alpha convention, antialiasing, and pixel-to-coordinate transform. Use transparency or a documented mask value outside the boundary. If exact geographic placement is needed, use GeoTIFF or a world-file/sidecar rather than an unreferenced PNG.
+- **Raster tiles or MBTiles:** record zoom range, tile scheme, projection, source geometry version, and simplification rule.
+- **KML, GeoPackage, TopoJSON, or other formats:** preserve CRS, holes, feature identity, attribution, and the conversion tool/version.
+
+Render a preview and inspect it for flipped latitude, cropped edges, missing holes, antimeridian seams, disconnected pieces, and geometry extending outside the expected bounds. Keep vector and raster filenames/version identifiers linked.
+
+### 8. Report provenance and hand off
+
+Return a compact receipt containing the accepted OSM object, rejected or ambiguous candidates, source URLs and retrieval time, boundary definition, validation results, output paths, export settings, and any fallback or manual correction. If publication is requested, stage only the reviewed files, preserve unrelated worktree changes, and verify the remote raw files and live site separately from local validation.
+
+## Decision rules
+
+- Prefer an explicit verified OSM ID over a fresh name search.
+- Prefer full OSM relation/member geometry over a Nominatim preview for the final vector.
+- Use area as a plausibility check, never as the sole identity criterion.
+- Distinguish natural land, water surface, administrative territory, protected-area designation, and facility footprint; they are not interchangeable.
+- Use Natural Earth, WDPA, or another source only as a declared fallback or composite source, with its own attribution and metadata.
+- Save vector first, then rasterize or convert; preserve the conversion settings.
+- Do not delete an old geometry or overwrite a raw cache until the replacement, catalog references, and rendered preview have passed validation.
+
+## Failure handling
+
+- **Same-name wrong object:** repeat with context, coordinates, aliases, and explicit OSM IDs; reject the result instead of accepting the first polygon.
+- **Island includes a country or territorial water:** inspect tags and area definition, compare the shape with a trusted reference, and choose a landmass relation or documented alternate source.
+- **Lake or park is missing or split:** query `natural=water`, `water=*`, relation members, and nearby coordinates; keep separate features separate unless the requested definition is a group boundary.
+- **Relation/API timeout:** retry a bounded endpoint/query with backoff, then document a fallback; do not silently replace the source.
+- **Geometry looks plausible but renders wrong:** check `[lon, lat]` order, ring closure, projection, y-axis direction, antimeridian handling, and hole winding before changing the data.
+- **Simplification changes the result:** reduce tolerance or retain the detailed geometry and generate a scale-specific derivative; record the measured area ratio.
+- **Attribution is missing:** stop the export handoff and restore OSM/ODbL or alternate-source attribution in the data and receipt.
+
+## Final checklist
+
+- [ ] Boundary definition and inclusion/exclusion rules are written down.
+- [ ] Candidate identity is pinned by verified `osmType` and `osmId`, or the alternate source is explicit.
+- [ ] Complete polygon/multipolygon geometry is saved in GeoJSON coordinate order.
+- [ ] Geometry, area, bounds, holes, and target-scale rendering have been checked.
+- [ ] Canonical metadata, provenance, license, and retrieval time are present.
+- [ ] SVG/PNG/raster/export settings and georeferencing sidecars are saved where needed.
+- [ ] Catalog references and output paths are consistent.
+- [ ] Only reviewed files are handed off for publication; unrelated changes remain untouched.
