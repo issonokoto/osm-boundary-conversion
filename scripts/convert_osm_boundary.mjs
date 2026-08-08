@@ -205,6 +205,7 @@ function wayGeometry(full, wayId) {
   if (!way) fail(`Way ${wayId} is missing from the OSM response`);
   const nodes = new Map(elements.filter((item) => item.type === 'node').map((item) => [String(item.id), [Number(item.lon), Number(item.lat)]]));
   if (!Array.isArray(way.nodes)) fail(`Way ${wayId} has no node list`);
+  if (way.nodes.length < 4 || String(way.nodes[0]) !== String(way.nodes[way.nodes.length - 1])) fail(`Way ${wayId} is an open line, not a closed polygon boundary`);
   const ring = cleanClosedRing(way.nodes.map((nodeId) => nodes.get(String(nodeId))));
   return { relation: null, geometry: { type: 'Polygon', coordinates: [normalizeOrientation(ring, true)] } };
 }
@@ -245,7 +246,7 @@ function coordinatesAreValid(geometry) {
   return allRings(geometry).flat().every(([lon, lat]) => Number.isFinite(lon) && Number.isFinite(lat) && lon >= -180 && lon <= 180 && lat >= -90 && lat <= 90);
 }
 
-const WATER_TYPES = new Set(['bay', 'coastline', 'lake', 'pond', 'reservoir', 'river', 'riverbank', 'sea', 'water', 'wetland']);
+const WATER_TYPES = new Set(['bay', 'channel', 'coastline', 'estuary', 'fjord', 'gulf', 'inlet', 'lagoon', 'lake', 'ocean', 'pond', 'reservoir', 'river', 'riverbank', 'sea', 'sound', 'strait', 'water', 'wetland']);
 
 function normalizedText(value) {
   return String(value ?? '').normalize('NFKC').trim().toLocaleLowerCase();
