@@ -51,6 +51,17 @@ function cleanClosedRing(points) {
   return ring;
 }
 
+function cleanOpenLine(points) {
+  if (!Array.isArray(points) || points.length < 2) fail('A line has fewer than two nodes');
+  const line = [];
+  for (const point of points) {
+    if (!point) fail('A line references a missing node');
+    if (!line.length || !samePoint(line[line.length - 1], point)) line.push(point);
+  }
+  if (line.length < 2) fail('A line has fewer than two distinct coordinates');
+  return line;
+}
+
 function signedArea(ring) {
   let sum = 0;
   for (let i = 0; i < ring.length - 1; i += 1) sum += ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1];
@@ -99,12 +110,12 @@ function segmentsIntersect(a, b, c, d) {
   return abC !== abD && cdA !== cdB;
 }
 
-function selfIntersectionCount(ring) {
+function selfIntersectionCount(ring, closed = true) {
   let count = 0;
   const segmentCount = ring.length - 1;
   for (let i = 0; i < segmentCount; i += 1) {
     for (let j = i + 1; j < segmentCount; j += 1) {
-      if (j === i + 1 || (i === 0 && j === segmentCount - 1)) continue;
+      if (j === i + 1 || (closed && i === 0 && j === segmentCount - 1)) continue;
       if (segmentsIntersect(ring[i], ring[i + 1], ring[j], ring[j + 1])) count += 1;
     }
   }
@@ -205,12 +216,22 @@ function wayGeometry(full, wayId) {
   if (!way) fail(`Way ${wayId} is missing from the OSM response`);
   const nodes = new Map(elements.filter((item) => item.type === 'node').map((item) => [String(item.id), [Number(item.lon), Number(item.lat)]]));
   if (!Array.isArray(way.nodes)) fail(`Way ${wayId} has no node list`);
-  if (way.nodes.length < 4 || String(way.nodes[0]) !== String(way.nodes[way.nodes.length - 1])) fail(`Way ${wayId} is an open line, not a closed polygon boundary`);
-  const ring = cleanClosedRing(way.nodes.map((nodeId) => nodes.get(String(nodeId))));
-  return { relation: null, geometry: { type: 'Polygon', coordinates: [normalizeOrientation(ring, true)] } };
+  const points = way.nodes.map((nodeId) => nodes.get(String(nodeId)));
+  const closed = way.nodes.length >= 2 && String(way.nodes[0]) === String(way.nodes[way.nodes.length - 1]);
+  if (!closed) return { relation: null, tags: way.tags ?? {}, geometry: { type: 'LineString', coordinates: cleanOpenLine(points) } };
+  if (way.nodes.length < 4) fail(`Way ${wayId} is closed but has fewer than four node references`);
+  const ring = cleanClosedRing(points);
+  return { relation: null, tags: way.tags ?? {}, geometry: { type: 'Polygon', coordinates: [normalizeOrientation(ring, true)] } };
 }
 
-function allRings(geometry) { return geometry.type === 'Polygon' ? geometry.coordinates : geometry.coordinates.flat(); }
+function isAreaGeometry(geometry) { return geometry.type === 'Polygon' || geometry.type === 'MultiPolygon'; }
+
+function allRings(geometry) {
+  if (geometry.type === 'LineString') return [geometry.coordinates];
+  if (geometry.type === 'Polygon') return geometry.coordinates;
+  if (geometry.type === 'MultiPolygon') return geometry.coordinates.flat();
+  fail(`Unsupported geometry type: ${geometry.type}`);
+}
 
 function bboxOf(geometry) {
   const points = allRings(geometry).flat();
@@ -219,6 +240,7 @@ function bboxOf(geometry) {
 }
 
 function sphericalAreaKm2(geometry) {
+  if (!isAreaGeometry(geometry)) return null;
   let area = 0;
   const polygons = geometry.type === 'Polygon' ? [geometry.coordinates] : geometry.coordinates;
   for (const polygon of polygons) {
@@ -242,6 +264,24 @@ function sphericalAreaKm2(geometry) {
   return Math.abs(area) / 1e6;
 }
 
+function haversineKm(a, b) {
+  const lat1 = a[1] * Math.PI / 180;
+  const lat2 = b[1] * Math.PI / 180;
+  const dLat = lat2 - lat1;
+  let dLon = (b[0] - a[0]) * Math.PI / 180;
+  if (dLon > Math.PI) dLon -= 2 * Math.PI;
+  if (dLon < -Math.PI) dLon += 2 * Math.PI;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 2 * EARTH_RADIUS_M * Math.asin(Math.min(1, Math.sqrt(h))) / 1000;
+}
+
+function lineLengthKm(geometry) {
+  if (geometry.type !== 'LineString') return null;
+  let length = 0;
+  for (let i = 0; i < geometry.coordinates.length - 1; i += 1) length += haversineKm(geometry.coordinates[i], geometry.coordinates[i + 1]);
+  return length;
+}
+
 function coordinatesAreValid(geometry) {
   return allRings(geometry).flat().every(([lon, lat]) => Number.isFinite(lon) && Number.isFinite(lat) && lon >= -180 && lon <= 180 && lat >= -90 && lat <= 90);
 }
@@ -256,7 +296,7 @@ function canonicalKind(value) {
   const kind = normalizedText(value).replace(/[_\s]+/g, '-');
   if (['administrative', 'administrative-area', 'admin', 'boundary'].includes(kind)) return 'administrative-area';
   if (['island', 'islet', 'archipelago', 'landmass'].includes(kind)) return 'island';
-  if (['water', 'water-body', 'waterbody', 'lake', 'pond', 'reservoir', 'river', 'sea', 'bay'].includes(kind)) return 'water';
+  if (['water', 'water-body', 'waterbody', 'lake', 'pond', 'reservoir', 'river', 'sea', 'bay'].includes(kind) || WATER_TYPES.has(kind)) return 'water';
   if (['park', 'protected-area'].includes(kind)) return 'park';
   if (['facility', 'site', 'footprint'].includes(kind)) return 'facility';
   return kind;
@@ -272,6 +312,14 @@ function candidateKind(item) {
   if (type === 'park' || tags.leisure === 'park') return 'park';
   if (category === 'amenity' || category === 'building' || category === 'leisure') return 'facility';
   return null;
+}
+
+function kindFromTags(tags = {}) {
+  return candidateKind({
+    category: tags.boundary === 'administrative' ? 'boundary' : null,
+    type: tags.natural ?? tags.place ?? tags.water ?? tags.leisure ?? null,
+    extratags: tags,
+  });
 }
 
 function candidateNames(item) {
@@ -321,19 +369,32 @@ function candidateContext(item) {
     .filter(Boolean))].join(' ');
 }
 
-function svgText(geometry, bbox, width, height, padding) {
+function svgViewport(bbox, padding) {
   const lonScale = Math.cos(((bbox[1] + bbox[3]) / 2) * Math.PI / 180);
-  const mapPoint = ([lon, lat]) => [padding + (lon - bbox[0]) * lonScale, padding + (bbox[3] - lat)];
-  const ringPath = (ring) => ring.map((point, index) => { const [x, y] = mapPoint(point); return `${index ? 'L' : 'M'}${x.toFixed(3)},${y.toFixed(3)}`; }).join(' ') + ' Z';
   const contentWidth = (bbox[2] - bbox[0]) * lonScale;
   const contentHeight = bbox[3] - bbox[1];
-  const viewWidth = contentWidth + padding * 2;
-  const viewHeight = contentHeight + padding * 2;
-  const d = allRings(geometry).map(ringPath).join(' ');
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${viewWidth.toFixed(6)} ${viewHeight.toFixed(6)}" preserveAspectRatio="xMidYMid meet"><path d="${d}" fill="#6c9f84" fill-rule="evenodd"/></svg>\n`;
+  return { lonScale, contentWidth, contentHeight, viewWidth: contentWidth + padding * 2, viewHeight: contentHeight + padding * 2 };
 }
 
-function usage() { console.error('Usage: node convert_osm_boundary.mjs --name NAME --context CONTEXT [--kind KIND] [--osm-type relation --osm-id ID] --output-dir DIR [--deep] [--reuse-cache]'); }
+function rasterDimensions(aspectRatio) {
+  const safeRatio = Number.isFinite(aspectRatio) && aspectRatio > 0 ? aspectRatio : 1;
+  return safeRatio >= 1
+    ? { width: 2048, height: Math.max(1, Math.round(2048 / safeRatio)) }
+    : { width: Math.max(1, Math.round(2048 * safeRatio)), height: 2048 };
+}
+
+function svgText(geometry, bbox, width, height, padding) {
+  const { lonScale, viewWidth, viewHeight } = svgViewport(bbox, padding);
+  const mapPoint = ([lon, lat]) => [padding + (lon - bbox[0]) * lonScale, padding + (bbox[3] - lat)];
+  const ringPath = (ring) => ring.map((point, index) => { const [x, y] = mapPoint(point); return `${index ? 'L' : 'M'}${x.toFixed(3)},${y.toFixed(3)}`; }).join(' ') + (isAreaGeometry(geometry) ? ' Z' : '');
+  const d = allRings(geometry).map(ringPath).join(' ');
+  const pathStyle = isAreaGeometry(geometry)
+    ? 'fill="#6c9f84" fill-rule="evenodd"'
+    : 'fill="none" stroke="#2b6cb0" stroke-width="0.15" stroke-linecap="round" stroke-linejoin="round"';
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${viewWidth.toFixed(6)} ${viewHeight.toFixed(6)}" preserveAspectRatio="xMidYMid meet"><path d="${d}" ${pathStyle}/></svg>\n`;
+}
+
+function usage() { console.error('Usage: node convert_osm_boundary.mjs --name NAME --context CONTEXT [--kind KIND] [--osm-type relation|way --osm-id ID] --output-dir DIR [--deep] [--no-svg] [--keep-raw] [--reuse-cache]'); }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -381,7 +442,7 @@ async function main() {
       if (error.code !== 'ENOENT') priorMetadata = null;
     }
   }
-  const kind = requestedKind ?? priorMetadata?.kind ?? inferredKind ?? 'boundary';
+  let kind = requestedKind ?? priorMetadata?.kind ?? inferredKind ?? 'boundary';
   const resolvedContext = context || priorMetadata?.context || discoveredContext;
   const boundaryDefinition = args['boundary-definition'] ? String(args['boundary-definition']) : priorMetadata?.boundaryDefinition ?? null;
   const priorReferenceArea = priorMetadata?.referenceComparison?.referenceAreaKm2;
@@ -400,45 +461,85 @@ async function main() {
   }
   if (!fetched) fetched = await fetchJson(objectUrl);
   const built = apiType === 'relation' ? relationGeometry(fetched.json, osmId) : wayGeometry(fetched.json, osmId);
+  if (!requestedKind && !priorMetadata?.kind && kind === 'boundary') {
+    kind = kindFromTags(built.relation?.tags ?? built.tags ?? {}) ?? kind;
+  }
   const geometry = built.geometry;
+  const areaGeometry = isAreaGeometry(geometry);
+  const lineGeometry = geometry.type === 'LineString';
   const bbox = bboxOf(geometry);
   if (!coordinatesAreValid(geometry)) fail('Geometry contains invalid or out-of-range coordinates');
   if (bbox[2] - bbox[0] > 180) fail('Antimeridian-crossing geometry requires an antimeridian-aware transform; refusing an incorrect ratio');
-  if (bbox[3] <= bbox[1]) fail('Geometry has no positive latitude span');
+  if (areaGeometry && bbox[3] <= bbox[1]) fail('Area geometry has no positive latitude span');
+  if (!areaGeometry && bbox[2] <= bbox[0] && bbox[3] <= bbox[1]) fail('Line geometry has no extent');
   const areaKm2 = sphericalAreaKm2(geometry);
+  const lineLength = lineLengthKm(geometry);
+  const longitudeSpan = bbox[2] - bbox[0];
+  const latitudeSpan = bbox[3] - bbox[1];
   const centerLat = (bbox[1] + bbox[3]) / 2;
-  const projectedAspectRatio = ((bbox[2] - bbox[0]) * Math.cos(centerLat * Math.PI / 180)) / (bbox[3] - bbox[1]);
-  const rasterWidth = projectedAspectRatio >= 1 ? 2048 : Math.max(1, Math.round(2048 * projectedAspectRatio));
-  const rasterHeight = projectedAspectRatio >= 1 ? Math.max(1, Math.round(2048 / projectedAspectRatio)) : 2048;
+  const coordinateBboxAspectRatio = latitudeSpan > 0 ? longitudeSpan / latitudeSpan : null;
+  const projectedAspectRatio = longitudeSpan > 0 && latitudeSpan > 0
+    ? (longitudeSpan * Math.cos(centerLat * Math.PI / 180)) / latitudeSpan
+    : null;
+  const projectedWidth = longitudeSpan * Math.cos(centerLat * Math.PI / 180);
+  const projectedHeight = latitudeSpan;
+  const svgPadding = Math.max(projectedWidth, projectedHeight) * 0.04;
+  const svgBounds = svgViewport(bbox, svgPadding);
+  const svgCanvasAspectRatio = svgBounds.viewHeight > 0 ? svgBounds.viewWidth / svgBounds.viewHeight : 1;
+  const svgDimensions = rasterDimensions(svgCanvasAspectRatio);
+  const maskDimensions = rasterDimensions(projectedAspectRatio);
   const rings = allRings(geometry);
-  const deepChecks = args.deep ? { selfIntersectionCount: rings.reduce((sum, ring) => sum + selfIntersectionCount(ring), 0) } : null;
+  const deepChecks = args.deep ? { selfIntersectionCount: rings.reduce((sum, ring) => sum + selfIntersectionCount(ring, areaGeometry), 0) } : null;
   if (deepChecks && deepChecks.selfIntersectionCount > 0) fail(`Self-intersections found: ${deepChecks.selfIntersectionCount}`);
-  const resolvedName = name ?? priorMetadata?.name ?? built.relation?.tags?.name ?? `${osmType}:${osmId}`;
-  const areaRatio = Number.isFinite(referenceAreaKm2) && referenceAreaKm2 > 0 ? areaKm2 / referenceAreaKm2 : null;
+  const resolvedName = name ?? priorMetadata?.name ?? built.relation?.tags?.name ?? built.tags?.name ?? `${osmType}:${osmId}`;
+  const areaRatio = areaKm2 != null && Number.isFinite(referenceAreaKm2) && referenceAreaKm2 > 0 ? areaKm2 / referenceAreaKm2 : null;
   const areaDifferencePercent = areaRatio == null ? null : (areaRatio - 1) * 100;
-  const geojson = { type: 'Feature', properties: { name: resolvedName, kind, context: resolvedContext, boundaryDefinition, osmType, osmId: Number(osmId), boundarySourceUrl: `https://www.openstreetmap.org/${osmType}/${osmId}`, license: 'OpenStreetMap contributors, ODbL 1.0' }, geometry };
+  const geometryAreaKm2 = areaKm2 == null ? null : Number(areaKm2.toFixed(8));
+  const lineLengthKmValue = lineLength == null ? null : Number(lineLength.toFixed(8));
+  const projectedAspectRatioValue = projectedAspectRatio == null ? null : Number(projectedAspectRatio.toFixed(8));
+  const coordinateBboxAspectRatioValue = coordinateBboxAspectRatio == null ? null : Number(coordinateBboxAspectRatio.toFixed(8));
+  const svgCanvasAspectRatioValue = Number(svgCanvasAspectRatio.toFixed(8));
+  const geometrySummary = {
+    type: geometry.type,
+    bbox,
+    areaKm2: geometryAreaKm2,
+    lineLengthKm: lineLengthKmValue,
+    vertexCount: rings.reduce((sum, ring) => sum + ring.length, 0),
+    ringCount: areaGeometry ? rings.length : 0,
+    closed: areaGeometry,
+    boundaryStatus: areaGeometry ? 'closed-area-boundary' : 'open-linear-feature',
+    coordinateBboxAspectRatio: coordinateBboxAspectRatioValue,
+    projectedAspectRatio: projectedAspectRatioValue,
+  };
+  const geojson = { type: 'Feature', properties: { name: resolvedName, kind, context: resolvedContext, boundaryDefinition, geometryType: geometry.type, boundaryStatus: geometrySummary.boundaryStatus, osmType, osmId: Number(osmId), boundarySourceUrl: `https://www.openstreetmap.org/${osmType}/${osmId}`, license: 'OpenStreetMap contributors, ODbL 1.0' }, geometry };
   await fs.writeFile(path.join(outputDir, `${stem}.geojson`), `${JSON.stringify(geojson, null, 2)}\n`, 'utf8');
   if (!args['no-svg']) {
-    const padding = Math.max(bbox[2] - bbox[0], bbox[3] - bbox[1]) * 0.04;
-    await fs.writeFile(path.join(outputDir, `${stem}.preview.svg`), svgText(geometry, bbox, rasterWidth, rasterHeight, padding), 'utf8');
+    await fs.writeFile(path.join(outputDir, `${stem}.preview.svg`), svgText(geometry, bbox, svgDimensions.width, svgDimensions.height, svgPadding), 'utf8');
   }
   if (args['keep-raw'] || args['reuse-cache']) await fs.writeFile(rawCachePath, fetched.text, 'utf8');
+  const svgExport = args['no-svg'] ? null : { file: `${stem}.preview.svg`, width: svgDimensions.width, height: svgDimensions.height, aspectRatio: svgCanvasAspectRatioValue, contentAspectRatio: projectedAspectRatioValue, projection: 'local equirectangular, one x/y scale', mode: lineGeometry ? 'line' : 'area' };
+  const pngMaskExport = lineGeometry
+    ? { supported: false, reason: 'An open LineString has no area to rasterize as a mask' }
+    : { supported: true, recommendedWidth: maskDimensions.width, recommendedHeight: maskDimensions.height, aspectRatio: projectedAspectRatioValue, rendered: false };
+  const validationChecks = areaGeometry
+    ? ['GeoJSON structure', 'closed rings', 'coordinate range', 'outer/inner assignment', 'aspect-preserving dimensions']
+    : ['GeoJSON structure', 'coordinate range', 'OSM way node order preserved', 'open linear feature preserved', 'line preview dimensions recorded'];
   const metadata = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatedAt: new Date().toISOString(),
     name: resolvedName,
     kind,
     context: resolvedContext,
     boundaryDefinition,
     source: { osmType, osmId: Number(osmId), objectUrl, responseSha256: sha256(fetched.text), discovery, fromCache, rawResponseFile: (args['keep-raw'] || args['reuse-cache']) ? `${stem}.osm-full.json` : null },
-    geometry: { type: geometry.type, bbox, areaKm2: Number(areaKm2.toFixed(8)), vertexCount: rings.reduce((sum, ring) => sum + ring.length, 0), ringCount: rings.length },
+    geometry: geometrySummary,
     referenceComparison: { referenceAreaKm2: Number.isFinite(referenceAreaKm2) ? referenceAreaKm2 : null, areaRatio, areaDifferencePercent },
-    export: { svg: args['no-svg'] ? null : { file: `${stem}.preview.svg`, aspectRatio: Number(projectedAspectRatio.toFixed(8)), projection: 'local equirectangular, one x/y scale' }, pngMask: { recommendedWidth: rasterWidth, recommendedHeight: rasterHeight, aspectRatio: Number(projectedAspectRatio.toFixed(8)), rendered: false } },
-    validation: { status: 'passed', checks: ['GeoJSON structure', 'closed rings', 'coordinate range', 'outer/inner assignment', 'aspect-preserving dimensions'], deepChecksRequested: Boolean(args.deep), deepChecks },
+    export: { svg: svgExport, pngMask: pngMaskExport },
+    validation: { status: lineGeometry ? 'passed-with-note' : 'passed', checks: validationChecks, deepChecksRequested: Boolean(args.deep), deepChecks },
     files: { geojson: `${stem}.geojson`, metadata: `${stem}.metadata.json`, previewSvg: args['no-svg'] ? null : `${stem}.preview.svg` },
   };
   await fs.writeFile(path.join(outputDir, `${stem}.metadata.json`), `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
-  console.log(JSON.stringify({ osm: `${osmType}:${osmId}`, geometry: geometry.type, areaKm2: Number(areaKm2.toFixed(6)), aspectRatio: Number(projectedAspectRatio.toFixed(6)), fromCache, outputDir }, null, 2));
+  console.log(JSON.stringify({ osm: `${osmType}:${osmId}`, geometry: geometry.type, areaKm2: areaKm2 == null ? null : Number(areaKm2.toFixed(6)), lineLengthKm: lineLength == null ? null : Number(lineLength.toFixed(6)), projectedAspectRatio: projectedAspectRatioValue, canvasAspectRatio: svgCanvasAspectRatioValue, fromCache, outputDir }, null, 2));
 }
 
 main().catch((error) => { console.error(error.stack || error.message || String(error)); process.exitCode = 1; });
