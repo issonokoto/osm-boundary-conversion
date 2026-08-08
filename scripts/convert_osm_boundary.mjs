@@ -369,6 +369,31 @@ function candidateContext(item) {
     .filter(Boolean))].join(' ');
 }
 
+async function findReusableTarget(outputDir, name, requestedKind, context) {
+  const entries = await fs.readdir(outputDir, { withFileTypes: true });
+  const matches = new Map();
+  const normalizedName = normalizedText(name);
+  const normalizedContext = normalizedText(context);
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.metadata.json')) continue;
+    try {
+      const metadata = JSON.parse(await fs.readFile(path.join(outputDir, entry.name), 'utf8'));
+      const source = metadata.source ?? {};
+      const osmType = source.osmType ?? metadata.osmType;
+      const osmId = source.osmId ?? metadata.osmId;
+      if (!osmType || !osmId || normalizedText(metadata.name) !== normalizedName) continue;
+      if (requestedKind && canonicalKind(metadata.kind) !== canonicalKind(requestedKind)) continue;
+      if (normalizedContext && metadata.context && !normalizedText(metadata.context).includes(normalizedContext)) continue;
+      const key = `${osmType}:${osmId}`;
+      if (!matches.has(key)) matches.set(key, { metadata, osmType, osmId: String(osmId) });
+    } catch {
+      // Ignore unrelated or incomplete metadata files while looking for a reusable target.
+    }
+  }
+  if (matches.size > 1) fail(`Ambiguous reusable targets for ${name}; provide --osm-type/--osm-id`);
+  return matches.values().next().value ?? null;
+}
+
 function svgViewport(bbox, padding) {
   const lonScale = Math.cos(((bbox[1] + bbox[3]) / 2) * Math.PI / 180);
   const contentWidth = (bbox[2] - bbox[0]) * lonScale;
@@ -416,13 +441,42 @@ async function main() {
   let osmId = explicitId;
   let inferredKind = null;
   let discoveredContext = '';
+  let discoveryCacheFile = null;
+  let priorMetadata = null;
+  if (!osmId && args['reuse-cache']) {
+    const reusable = await findReusableTarget(outputDir, name, requestedKind, context);
+    if (reusable) {
+      priorMetadata = reusable.metadata;
+      osmType = reusable.osmType;
+      osmId = reusable.osmId;
+      inferredKind = priorMetadata.kind ?? null;
+      discoveredContext = priorMetadata.context ?? '';
+      discovery = priorMetadata.source?.discovery ?? null;
+      discoveryCacheFile = priorMetadata.source?.discoveryCacheFile ?? null;
+    }
+  }
   if (!osmId) {
     const query = [name, context].filter(Boolean).join(', ');
     const url = new URL('https://nominatim.openstreetmap.org/search');
     url.search = new URLSearchParams({ format: 'jsonv2', addressdetails: '1', extratags: '1', namedetails: '1', limit: '5', q: query }).toString();
-    const response = await fetchJson(url);
-    discovery = { url: url.toString(), query, candidates: response.json, responseSha256: sha256(response.text) };
-    const candidate = selectCandidate(response.json, name, context, requestedKind);
+    discoveryCacheFile = path.join(outputDir, `.nominatim-${sha256(query).slice(0, 16)}.json`);
+    if (args['reuse-cache']) {
+      try {
+        const cachedDiscovery = JSON.parse(await fs.readFile(discoveryCacheFile, 'utf8'));
+        if (cachedDiscovery.query === query && Array.isArray(cachedDiscovery.candidates)) {
+          discovery = cachedDiscovery;
+          discovery.fromCache = true;
+        }
+      } catch (error) {
+        if (error.code !== 'ENOENT') discovery = null;
+      }
+    }
+    if (!discovery) {
+      const response = await fetchJson(url);
+      discovery = { url: url.toString(), query, candidates: response.json, responseSha256: sha256(response.text), fromCache: false };
+      await fs.writeFile(discoveryCacheFile, `${JSON.stringify(discovery, null, 2)}\n`, 'utf8');
+    }
+    const candidate = selectCandidate(discovery.candidates, name, context, requestedKind);
     if (!candidate) fail(`No OSM ${requestedKind ? `${requestedKind} ` : ''}boundary candidate found for ${query}`);
     osmType = candidate.osm_type;
     osmId = String(candidate.osm_id);
@@ -434,8 +488,7 @@ async function main() {
   const apiType = osmType === 'relation' ? 'relation' : 'way';
   const objectUrl = `https://api.openstreetmap.org/api/0.6/${apiType}/${osmId}/full.json`;
   const stem = `${osmType === 'relation' ? 'R' : 'W'}${osmId}`;
-  let priorMetadata = null;
-  if (args['reuse-cache']) {
+  if (args['reuse-cache'] && !priorMetadata) {
     try {
       priorMetadata = JSON.parse(await fs.readFile(path.join(outputDir, `${stem}.metadata.json`), 'utf8'));
     } catch (error) {
@@ -531,12 +584,12 @@ async function main() {
     kind,
     context: resolvedContext,
     boundaryDefinition,
-    source: { osmType, osmId: Number(osmId), objectUrl, responseSha256: sha256(fetched.text), discovery, fromCache, rawResponseFile: (args['keep-raw'] || args['reuse-cache']) ? `${stem}.osm-full.json` : null },
+    source: { osmType, osmId: Number(osmId), objectUrl, responseSha256: sha256(fetched.text), discovery, discoveryCacheFile: discoveryCacheFile ? path.basename(discoveryCacheFile) : null, fromCache, rawResponseFile: (args['keep-raw'] || args['reuse-cache']) ? `${stem}.osm-full.json` : null },
     geometry: geometrySummary,
     referenceComparison: { referenceAreaKm2: Number.isFinite(referenceAreaKm2) ? referenceAreaKm2 : null, areaRatio, areaDifferencePercent },
     export: { svg: svgExport, pngMask: pngMaskExport },
     validation: { status: lineGeometry ? 'passed-with-note' : 'passed', checks: validationChecks, deepChecksRequested: Boolean(args.deep), deepChecks },
-    files: { geojson: `${stem}.geojson`, metadata: `${stem}.metadata.json`, previewSvg: args['no-svg'] ? null : `${stem}.preview.svg` },
+    files: { geojson: `${stem}.geojson`, metadata: `${stem}.metadata.json`, previewSvg: args['no-svg'] ? null : `${stem}.preview.svg`, discoveryCache: discoveryCacheFile ? path.basename(discoveryCacheFile) : null },
   };
   await fs.writeFile(path.join(outputDir, `${stem}.metadata.json`), `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
   console.log(JSON.stringify({ osm: `${osmType}:${osmId}`, geometry: geometry.type, areaKm2: areaKm2 == null ? null : Number(areaKm2.toFixed(6)), lineLengthKm: lineLength == null ? null : Number(lineLength.toFixed(6)), projectedAspectRatio: projectedAspectRatioValue, canvasAspectRatio: svgCanvasAspectRatioValue, fromCache, outputDir }, null, 2));
