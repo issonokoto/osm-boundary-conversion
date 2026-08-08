@@ -33,6 +33,8 @@ Use the direct Nominatim/OSM HTTP endpoints for this workflow. Do not use generi
 
 Typical tags to inspect include `type=multipolygon`, `boundary=administrative`, `natural=coastline`, `natural=water`, `water=lake`, `place=island`, `leisure=park`, and the feature's local name tags. Tags are evidence, not a substitute for checking the actual geometry and intended definition.
 
+The bundled converter recognizes both administrative and natural-feature candidates. Use `--kind administrative-area`, `--kind island`, `--kind water`, or `--kind park` when the intended boundary is known. Without `--kind`, it infers a supported kind from the Nominatim category/type and still stops on tied candidates instead of choosing the first same-name result.
+
 Use a fast path when a verified `osmType` and `osmId` are already available: skip Nominatim name search, fetch the complete pinned object once, and validate the result locally. Treat alternate geometries such as Geolonia, Natural Earth, or WDPA as optional comparisons, not required steps on every run. Put a bounded timeout on network requests, avoid unbounded retry/sleep loops, and reuse a local response cache when the source revision has not changed.
 
 Use three execution modes:
@@ -48,6 +50,8 @@ When this skill folder contains `scripts/convert_osm_boundary.mjs`, use that bun
 ```text
 node scripts/convert_osm_boundary.mjs --name "豊中市" --context "大阪府 日本" --output-dir outputs
 node scripts/convert_osm_boundary.mjs --osm-type relation --osm-id 358672 --name "豊中市" --output-dir outputs
+node scripts/convert_osm_boundary.mjs --name "淡路島" --kind island --context "兵庫県 日本" --output-dir outputs
+node scripts/convert_osm_boundary.mjs --name "琵琶湖" --kind water --context "滋賀県 日本" --output-dir outputs
 node scripts/convert_osm_boundary.mjs --osm-type relation --osm-id 358672 --output-dir outputs --reuse-cache
 ```
 
@@ -59,7 +63,7 @@ Compare every viable candidate on all of the following:
 
 1. exact or alias name and language tags;
 2. country, prefecture, municipality, or nearby landmark context;
-3. tags and object type appropriate to the requested boundary;
+3. tags and object type appropriate to the requested boundary (`boundary=administrative`, `place=island`, `natural=water`, `water=lake`, and similar);
 4. centroid and bounding box;
 5. polygon or multipolygon shape, including holes and disconnected parts;
 6. rough area and plausibility against an official or trusted reference.
@@ -159,6 +163,7 @@ Return a compact receipt containing the accepted OSM object, rejected or ambiguo
 ## Failure handling
 
 - **Same-name wrong object:** repeat with context, coordinates, aliases, and explicit OSM IDs; reject the result instead of accepting the first polygon.
+- **Water or island is not recognized:** check the Nominatim `category`/`type` (`water`/`lake`, `place`/`island`) and retry with `--kind water` or `--kind island`; do not require `boundary=administrative` for natural features.
 - **Island includes a country or territorial water:** inspect tags and area definition, compare the shape with a trusted reference, and choose a landmass relation or documented alternate source.
 - **Lake or park is missing or split:** query `natural=water`, `water=*`, relation members, and nearby coordinates; keep separate features separate unless the requested definition is a group boundary.
 - **Relation/API timeout:** retry a bounded endpoint/query with backoff, then document a fallback; do not silently replace the source.
