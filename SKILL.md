@@ -25,13 +25,23 @@ If the request does not distinguish a natural feature from an administrative bou
 
 ### 2. Discover candidates
 
-Use Nominatim for human-readable candidate discovery and quick polygon inspection. Request polygon geometry only when it is useful, and retain the returned `osm_type`, `osm_id`, display name, tags, address context, and query. Use `lookup` with an explicit OSM reference once an ID is known.
+Use Nominatim for human-readable candidate discovery. For the initial lookup, do not request `polygon_geojson=1`: geometry in the discovery response is a large, avoidable transfer. Default to `format=jsonv2&addressdetails=1&extratags=1&namedetails=1&limit=5`, retain the returned `osm_type`, `osm_id`, display name, tags, address context, and query, and fetch complete geometry only after selecting a candidate. Request polygon geometry only when identity is still ambiguous and only for the smallest necessary candidate set.
 
 Use Overpass or the OSM API when the task needs tagged-element discovery, a closed way, or complete relation members and geometry. Query by name plus context, coordinates, or relevant tags; do not treat a name-only match as proof of identity. Respect public-service rate limits, send a descriptive User-Agent, cache responses, and retry transient errors with backoff.
+
+Use the direct Nominatim/OSM HTTP endpoints for this workflow. Do not use generic web search, browser page scraping, or a search result page to reach an OSM API endpoint; those add latency and make the request harder to bound.
 
 Typical tags to inspect include `type=multipolygon`, `boundary=administrative`, `natural=coastline`, `natural=water`, `water=lake`, `place=island`, `leisure=park`, and the feature's local name tags. Tags are evidence, not a substitute for checking the actual geometry and intended definition.
 
 Use a fast path when a verified `osmType` and `osmId` are already available: skip Nominatim name search, fetch the complete pinned object once, and validate the result locally. Treat alternate geometries such as Geolonia, Natural Earth, or WDPA as optional comparisons, not required steps on every run. Put a bounded timeout on network requests, avoid unbounded retry/sleep loops, and reuse a local response cache when the source revision has not changed.
+
+Use three execution modes:
+
+- **Quick (default):** one Nominatim discovery request when no ID is supplied, one complete OSM object request, local geometry checks, and canonical GeoJSON plus metadata and SVG/export specifications.
+- **Deep (opt-in):** official-area lookup, alternate-source comparison, PNG preview, or visual inspection only when the user requests it, the quick checks are ambiguous, or the feature is unusually complex.
+- **Fallback:** if a bounded request fails or exceeds its timeout, stop that request, report the exact stage, and use a documented alternate source only when appropriate. Do not silently start a long chain of retries.
+
+For a new name-based request, use a total network budget of roughly 45 seconds: one discovery request and one full-object request, with at most one bounded retry for a transient failure. Once an ID is fixed, never repeat discovery for the same run.
 
 ### 3. Select and pin the correct OSM object
 
@@ -67,6 +77,8 @@ Run checks appropriate to the feature and output scale:
 - comparison with official/reference area and the intended boundary meaning;
 - area preservation after any simplification, with a stated tolerance;
 - visual overlay or rendered preview at the target scale.
+
+In Quick mode, perform the structural, ring, coordinate, area-plausibility, and aspect-ratio checks locally. Do not block the save on a fresh official website, Geolonia, or raster-renderer request when those references are not already cached; record them as optional checks instead.
 
 For global features, do not calculate area with a flat longitude/latitude shoelace formula without accounting for projection and antimeridian behavior. A large area mismatch is a signal to revisit the candidate and definition, not something to hide by changing metadata.
 
@@ -113,7 +125,7 @@ Treat GeoJSON or another validated vector as canonical; never make a screenshot 
 - **Raster tiles or MBTiles:** record zoom range, tile scheme, projection, source geometry version, and simplification rule.
 - **KML, GeoPackage, TopoJSON, or other formats:** preserve CRS, holes, feature identity, attribution, and the conversion tool/version.
 
-Render a preview and inspect it for flipped latitude, cropped edges, missing holes, antimeridian seams, disconnected pieces, and geometry extending outside the expected bounds. Keep vector and raster filenames/version identifiers linked.
+Render a preview and inspect it for flipped latitude, cropped edges, missing holes, antimeridian seams, disconnected pieces, and geometry extending outside the expected bounds when a visual preview is requested or needed. Keep vector and raster filenames/version identifiers linked. Do not generate a PNG merely to validate an SVG or GeoJSON structure; a PNG preview is Deep mode unless the user explicitly asks for a raster image.
 
 For aspect-preserving output, use one projected x/y scale and derive dimensions from the projected ratio. Make the SVG canvas ratio agree with the projected content ratio within rounding tolerance. If a square canvas is explicitly required, letterbox or pad it while keeping one scale; never map longitude and latitude independently to the full square. Derive raster dimensions from the same ratio, for example a projected ratio of `1.3919` with a long edge of `2048` becomes approximately `2048×1471`, not `2048×2048`.
 
@@ -127,6 +139,7 @@ Return a compact receipt containing the accepted OSM object, rejected or ambiguo
 - Prefer full OSM relation/member geometry over a Nominatim preview for the final vector.
 - Use area as a plausibility check, never as the sole identity criterion.
 - When an explicit ID is pinned, do not repeat discovery or unrelated reference downloads during ordinary regeneration.
+- In Quick mode, keep network work to one discovery request plus one complete-object request; do not add official-site, Geolonia, or PNG requests unless they are needed or requested.
 - Distinguish natural land, water surface, administrative territory, protected-area designation, and facility footprint; they are not interchangeable.
 - Use Natural Earth, WDPA, or another source only as a declared fallback or composite source, with its own attribution and metadata.
 - Save vector first, then rasterize or convert; preserve the conversion settings.
@@ -144,6 +157,12 @@ Return a compact receipt containing the accepted OSM object, rejected or ambiguo
 - **A ratio answer seems contradictory:** label whether it is area, coordinate-bbox, projected-content, or canvas ratio before making a conclusion.
 - **Simplification changes the result:** reduce tolerance or retain the detailed geometry and generate a scale-specific derivative; record the measured area ratio.
 - **Attribution is missing:** stop the export handoff and restore OSM/ODbL or alternate-source attribution in the data and receipt.
+
+## Keep execution bounded
+
+- Prefer an existing reusable converter or one compact deterministic helper. Do not build a long bespoke reconstruction, rasterization, and audit script in several exploratory stages when the canonical OSM response can be processed directly.
+- After one successful fetch and one successful local validation, save the outputs and report them. Do not fetch the same relation again solely to recalculate a hash, redraw a preview, or repeat a check already recorded in metadata.
+- If a required step is still running after its budget, stop and report the stage and elapsed time; do not continue silently or ask the user to wait without a concrete diagnostic.
 
 ## Final checklist
 
