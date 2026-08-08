@@ -245,6 +245,81 @@ function coordinatesAreValid(geometry) {
   return allRings(geometry).flat().every(([lon, lat]) => Number.isFinite(lon) && Number.isFinite(lat) && lon >= -180 && lon <= 180 && lat >= -90 && lat <= 90);
 }
 
+const WATER_TYPES = new Set(['bay', 'coastline', 'lake', 'pond', 'reservoir', 'river', 'riverbank', 'sea', 'water', 'wetland']);
+
+function normalizedText(value) {
+  return String(value ?? '').normalize('NFKC').trim().toLocaleLowerCase();
+}
+
+function canonicalKind(value) {
+  const kind = normalizedText(value).replace(/[_\s]+/g, '-');
+  if (['administrative', 'administrative-area', 'admin', 'boundary'].includes(kind)) return 'administrative-area';
+  if (['island', 'islet', 'archipelago', 'landmass'].includes(kind)) return 'island';
+  if (['water', 'water-body', 'waterbody', 'lake', 'pond', 'reservoir', 'river', 'sea', 'bay'].includes(kind)) return 'water';
+  if (['park', 'protected-area'].includes(kind)) return 'park';
+  if (['facility', 'site', 'footprint'].includes(kind)) return 'facility';
+  return kind;
+}
+
+function candidateKind(item) {
+  const category = normalizedText(item.category ?? item.class);
+  const type = normalizedText(item.type);
+  const tags = Object.fromEntries(Object.entries(item.extratags ?? {}).map(([key, value]) => [normalizedText(key), normalizedText(value)]));
+  if (category === 'boundary' || type === 'administrative' || tags.boundary === 'administrative') return 'administrative-area';
+  if (type === 'island' || type === 'islet' || type === 'archipelago' || tags.place === 'island') return 'island';
+  if (category === 'water' || WATER_TYPES.has(type) || tags.natural === 'water' || Boolean(tags.water)) return 'water';
+  if (type === 'park' || tags.leisure === 'park') return 'park';
+  if (category === 'amenity' || category === 'building' || category === 'leisure') return 'facility';
+  return null;
+}
+
+function candidateNames(item) {
+  return [item.name, item.display_name?.split(',')[0], ...Object.values(item.namedetails ?? {})].filter(Boolean).map(normalizedText);
+}
+
+function candidateNameScore(item, targetName) {
+  const target = normalizedText(targetName);
+  if (normalizedText(item.name) === target) return 4;
+  if (normalizedText(item.display_name?.split(',')[0]) === target) return 3;
+  if (candidateNames(item).includes(target)) return 2;
+  return 0;
+}
+
+function candidateContextScore(item, context) {
+  const tokens = String(context ?? '').split(/[\s,、，/]+/).map(normalizedText).filter((token) => token.length >= 2);
+  if (!tokens.length) return 0;
+  const haystack = normalizedText([item.display_name, ...Object.values(item.address ?? {})].join(' '));
+  return tokens.reduce((score, token) => score + (haystack.includes(token) ? 1 : 0), 0);
+}
+
+function candidateMatchesKind(item, requestedKind) {
+  const actual = candidateKind(item);
+  return actual != null && (!requestedKind || actual === canonicalKind(requestedKind));
+}
+
+function selectCandidate(items, name, context, requestedKind) {
+  const ranked = items
+    .filter((item) => (item.osm_type === 'relation' || item.osm_type === 'way') && candidateNameScore(item, name) > 0 && candidateMatchesKind(item, requestedKind))
+    .map((item) => ({ item, score: candidateNameScore(item, name) * 100 + candidateContextScore(item, context) * 10 + (requestedKind ? 5 : 0) }))
+    .sort((a, b) => b.score - a.score);
+  if (!ranked.length) return null;
+  const topScore = ranked[0].score;
+  const top = ranked.filter((entry) => entry.score === topScore);
+  const uniqueTop = new Map(top.map((entry) => [`${entry.item.osm_type}:${entry.item.osm_id}`, entry.item]));
+  if (uniqueTop.size > 1) {
+    const ids = [...uniqueTop.keys()].join(', ');
+    fail(`Ambiguous OSM candidates for ${name}${context ? `, ${context}` : ''}: ${ids}; provide --context or --osm-type/--osm-id`);
+  }
+  return top[0].item;
+}
+
+function candidateContext(item) {
+  return [...new Set(Object.entries(item.address ?? {})
+    .filter(([key]) => !key.toLowerCase().startsWith('iso3166') && key !== 'country_code' && key !== 'island' && key !== 'lake')
+    .map(([, value]) => value)
+    .filter(Boolean))].join(' ');
+}
+
 function svgText(geometry, bbox, width, height, padding) {
   const lonScale = Math.cos(((bbox[1] + bbox[3]) / 2) * Math.PI / 180);
   const mapPoint = ([lon, lat]) => [padding + (lon - bbox[0]) * lonScale, padding + (bbox[3] - lat)];
@@ -257,7 +332,7 @@ function svgText(geometry, bbox, width, height, padding) {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${viewWidth.toFixed(6)} ${viewHeight.toFixed(6)}" preserveAspectRatio="xMidYMid meet"><path d="${d}" fill="#6c9f84" fill-rule="evenodd"/></svg>\n`;
 }
 
-function usage() { console.error('Usage: node convert_osm_boundary.mjs --name NAME --context CONTEXT [--osm-type relation --osm-id ID] --output-dir DIR [--deep] [--reuse-cache]'); }
+function usage() { console.error('Usage: node convert_osm_boundary.mjs --name NAME --context CONTEXT [--kind KIND] [--osm-type relation --osm-id ID] --output-dir DIR [--deep] [--reuse-cache]'); }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -266,27 +341,32 @@ async function main() {
   const explicitId = args['osm-id'] ? String(args['osm-id']) : null;
   const name = args.name ? String(args.name) : null;
   const context = args.context ? String(args.context) : '';
+  const requestedKind = args.kind ? String(args.kind) : null;
   if (args.help) { usage(); return; }
   if (!explicitId && !name) { usage(); fail('Provide --name or both --osm-type and --osm-id'); }
+  if (explicitId && !explicitType) fail('--osm-type is required with --osm-id');
+  if (explicitId && (!/^\d+$/.test(explicitId) || Number(explicitId) <= 0)) fail('--osm-id must be a positive integer');
   if (explicitType && explicitType !== 'relation' && explicitType !== 'way') fail('--osm-type must be relation or way');
   await fs.mkdir(outputDir, { recursive: true });
 
   let discovery = null;
   let osmType = explicitType;
   let osmId = explicitId;
+  let inferredKind = null;
+  let discoveredContext = '';
   if (!osmId) {
     const query = [name, context].filter(Boolean).join(', ');
     const url = new URL('https://nominatim.openstreetmap.org/search');
     url.search = new URLSearchParams({ format: 'jsonv2', addressdetails: '1', extratags: '1', namedetails: '1', limit: '5', q: query }).toString();
     const response = await fetchJson(url);
     discovery = { url: url.toString(), query, candidates: response.json, responseSha256: sha256(response.text) };
-    const candidate = response.json.find((item) => {
-      const label = `${item.category ?? item.class ?? ''} ${item.type ?? ''}`;
-      return (item.name === name || item.display_name?.startsWith(`${name},`)) && (item.osm_type === 'relation' || item.osm_type === 'way') && (label.includes('boundary') || label.includes('administrative'));
-    });
-    if (!candidate) fail(`No OSM boundary candidate found for ${query}`);
+    const candidate = selectCandidate(response.json, name, context, requestedKind);
+    if (!candidate) fail(`No OSM ${requestedKind ? `${requestedKind} ` : ''}boundary candidate found for ${query}`);
     osmType = candidate.osm_type;
     osmId = String(candidate.osm_id);
+    inferredKind = candidateKind(candidate);
+    discoveredContext = candidateContext(candidate);
+    discovery.selection = { requestedKind, inferredKind, selectedCandidate: { osmType, osmId: Number(osmId), name: candidate.name, displayName: candidate.display_name, category: candidate.category ?? candidate.class ?? null, type: candidate.type } };
   }
 
   const apiType = osmType === 'relation' ? 'relation' : 'way';
@@ -300,8 +380,8 @@ async function main() {
       if (error.code !== 'ENOENT') priorMetadata = null;
     }
   }
-  const kind = args.kind ? String(args.kind) : priorMetadata?.kind ?? 'boundary';
-  const resolvedContext = context || priorMetadata?.context || '';
+  const kind = requestedKind ?? priorMetadata?.kind ?? inferredKind ?? 'boundary';
+  const resolvedContext = context || priorMetadata?.context || discoveredContext;
   const boundaryDefinition = args['boundary-definition'] ? String(args['boundary-definition']) : priorMetadata?.boundaryDefinition ?? null;
   const priorReferenceArea = priorMetadata?.referenceComparison?.referenceAreaKm2;
   const referenceAreaKm2 = args['reference-area-km2'] ? Number(args['reference-area-km2']) : (Number.isFinite(priorReferenceArea) ? priorReferenceArea : null);
