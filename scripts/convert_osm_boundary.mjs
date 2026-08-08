@@ -16,7 +16,7 @@ function parseArgs(argv) {
     const token = argv[i];
     if (!token.startsWith('--')) continue;
     const key = token.slice(2);
-    if (key === 'deep' || key === 'no-svg' || key === 'keep-raw') args[key] = true;
+    if (key === 'help' || key === 'deep' || key === 'no-svg' || key === 'keep-raw' || key === 'reuse-cache') args[key] = true;
     else args[key] = argv[++i];
   }
   return args;
@@ -40,6 +40,7 @@ function sha256(text) { return crypto.createHash('sha256').update(text).digest('
 function samePoint(a, b) { return a[0] === b[0] && a[1] === b[1]; }
 
 function cleanClosedRing(points) {
+  if (!Array.isArray(points) || points.length < 3) fail('A way has fewer than three nodes');
   const ring = [];
   for (const point of points) {
     if (!point) fail('A way references a missing node');
@@ -115,26 +116,47 @@ function reverseSegment(segment) {
 }
 
 function joinRings(segments) {
-  const remaining = segments.slice();
+  const remaining = new Map(segments.map((segment) => [segment.id, segment]));
+  const endpointIndex = new Map();
+  for (const segment of segments) {
+    for (const node of new Set([segment.nodes[0], segment.nodes[segment.nodes.length - 1]])) {
+      if (!endpointIndex.has(node)) endpointIndex.set(node, new Set());
+      endpointIndex.get(node).add(segment.id);
+    }
+  }
+  const removeSegment = (segment) => {
+    remaining.delete(segment.id);
+    for (const node of new Set([segment.nodes[0], segment.nodes[segment.nodes.length - 1]])) {
+      const ids = endpointIndex.get(node);
+      if (!ids) continue;
+      ids.delete(segment.id);
+      if (!ids.size) endpointIndex.delete(node);
+    }
+  };
+  const findAt = (node) => {
+    for (const id of endpointIndex.get(node) ?? []) {
+      const segment = remaining.get(id);
+      if (segment) return segment;
+    }
+    return null;
+  };
   const rings = [];
-  while (remaining.length) {
-    const first = remaining.shift();
+  while (remaining.size) {
+    const first = remaining.values().next().value;
+    removeSegment(first);
     let nodes = first.nodes.slice();
     let coords = first.coords.map((point) => [...point]);
+    let steps = 0;
     while (nodes[0] !== nodes[nodes.length - 1]) {
       const head = nodes[0];
       const tail = nodes[nodes.length - 1];
-      const index = remaining.findIndex((candidate) => {
-        const firstNode = candidate.nodes[0];
-        const lastNode = candidate.nodes[candidate.nodes.length - 1];
-        return firstNode === tail || lastNode === tail || firstNode === head || lastNode === head;
-      });
-      if (index < 0) fail(`Open ${first.role} ring near nodes ${head}/${tail}`);
-      const candidate = remaining.splice(index, 1)[0];
+      const candidate = findAt(tail) ?? findAt(head);
+      if (!candidate) fail(`Open ${first.role} ring near nodes ${head}/${tail}`);
       const joinsTail = candidate.nodes[0] === tail || candidate.nodes[candidate.nodes.length - 1] === tail;
       const oriented = joinsTail
         ? (candidate.nodes[0] === tail ? candidate : reverseSegment(candidate))
         : (candidate.nodes[candidate.nodes.length - 1] === head ? candidate : reverseSegment(candidate));
+      removeSegment(candidate);
       if (joinsTail) {
         nodes = nodes.concat(oriented.nodes.slice(1));
         coords = coords.concat(oriented.coords.slice(1).map((point) => [...point]));
@@ -142,7 +164,8 @@ function joinRings(segments) {
         nodes = oriented.nodes.slice(0, -1).concat(nodes);
         coords = oriented.coords.slice(0, -1).map((point) => [...point]).concat(coords);
       }
-      if (remaining.length + 1 > segments.length + 1) fail(`Too many ways while joining ${first.role} ring`);
+      steps += 1;
+      if (steps > segments.length) fail(`Too many ways while joining ${first.role} ring`);
     }
     rings.push(cleanClosedRing(coords));
   }
@@ -160,9 +183,11 @@ function relationGeometry(full, relationId) {
     if (member.type !== 'way' || !groups[member.role]) continue;
     const way = ways.get(String(member.ref));
     if (!way) fail(`Missing way ${member.ref}`);
+    if (!Array.isArray(way.nodes)) fail(`Way ${member.ref} has no node list`);
     const coords = way.nodes.map((nodeId) => nodes.get(String(nodeId)));
     groups[member.role].push({ id: String(member.ref), role: member.role, nodes: way.nodes.map(String), coords });
   }
+  if (!groups.outer.length) fail(`Relation ${relationId} has no outer ways`);
   const outers = joinRings(groups.outer).map((ring) => normalizeOrientation(ring, true));
   const inners = joinRings(groups.inner).map((ring) => normalizeOrientation(ring, false));
   const polygons = outers.map((outer) => [outer]);
@@ -179,6 +204,7 @@ function wayGeometry(full, wayId) {
   const way = elements.find((item) => item.type === 'way' && String(item.id) === String(wayId));
   if (!way) fail(`Way ${wayId} is missing from the OSM response`);
   const nodes = new Map(elements.filter((item) => item.type === 'node').map((item) => [String(item.id), [Number(item.lon), Number(item.lat)]]));
+  if (!Array.isArray(way.nodes)) fail(`Way ${wayId} has no node list`);
   const ring = cleanClosedRing(way.nodes.map((nodeId) => nodes.get(String(nodeId))));
   return { relation: null, geometry: { type: 'Polygon', coordinates: [normalizeOrientation(ring, true)] } };
 }
@@ -187,26 +213,36 @@ function allRings(geometry) { return geometry.type === 'Polygon' ? geometry.coor
 
 function bboxOf(geometry) {
   const points = allRings(geometry).flat();
+  if (!points.length) fail('Geometry has no coordinates');
   return [Math.min(...points.map((point) => point[0])), Math.min(...points.map((point) => point[1])), Math.max(...points.map((point) => point[0])), Math.max(...points.map((point) => point[1]))];
 }
 
 function sphericalAreaKm2(geometry) {
   let area = 0;
-  for (const ring of allRings(geometry)) {
-    let sum = 0;
-    for (let i = 0; i < ring.length - 1; i += 1) {
-      const lon1 = ring[i][0] * Math.PI / 180;
-      const lon2 = ring[i + 1][0] * Math.PI / 180;
-      const lat1 = ring[i][1] * Math.PI / 180;
-      const lat2 = ring[i + 1][1] * Math.PI / 180;
-      let delta = lon2 - lon1;
-      if (delta > Math.PI) delta -= 2 * Math.PI;
-      if (delta < -Math.PI) delta += 2 * Math.PI;
-      sum += delta * (Math.sin(lat1) + Math.sin(lat2));
+  const polygons = geometry.type === 'Polygon' ? [geometry.coordinates] : geometry.coordinates;
+  for (const polygon of polygons) {
+    const rings = [polygon[0], ...polygon.slice(1)];
+    for (const ring of rings) {
+      let sum = 0;
+      for (let i = 0; i < ring.length - 1; i += 1) {
+        const lon1 = ring[i][0] * Math.PI / 180;
+        const lon2 = ring[i + 1][0] * Math.PI / 180;
+        const lat1 = ring[i][1] * Math.PI / 180;
+        const lat2 = ring[i + 1][1] * Math.PI / 180;
+        let delta = lon2 - lon1;
+        if (delta > Math.PI) delta -= 2 * Math.PI;
+        if (delta < -Math.PI) delta += 2 * Math.PI;
+        sum += delta * (Math.sin(lat1) + Math.sin(lat2));
+      }
+      const ringArea = Math.abs(sum * EARTH_RADIUS_M ** 2 / 2);
+      area += ring === polygon[0] ? ringArea : -ringArea;
     }
-    area += Math.abs(sum * EARTH_RADIUS_M ** 2 / 2) * (signedArea(ring) >= 0 ? 1 : -1);
   }
   return Math.abs(area) / 1e6;
+}
+
+function coordinatesAreValid(geometry) {
+  return allRings(geometry).flat().every(([lon, lat]) => Number.isFinite(lon) && Number.isFinite(lat) && lon >= -180 && lon <= 180 && lat >= -90 && lat <= 90);
 }
 
 function svgText(geometry, bbox, width, height, padding) {
@@ -221,7 +257,7 @@ function svgText(geometry, bbox, width, height, padding) {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${viewWidth.toFixed(6)} ${viewHeight.toFixed(6)}" preserveAspectRatio="xMidYMid meet"><path d="${d}" fill="#6c9f84" fill-rule="evenodd"/></svg>\n`;
 }
 
-function usage() { console.error('Usage: node convert_osm_boundary.mjs --name NAME --context CONTEXT [--osm-type relation --osm-id ID] --output-dir DIR [--deep]'); }
+function usage() { console.error('Usage: node convert_osm_boundary.mjs --name NAME --context CONTEXT [--osm-type relation --osm-id ID] --output-dir DIR [--deep] [--reuse-cache]'); }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -230,7 +266,9 @@ async function main() {
   const explicitId = args['osm-id'] ? String(args['osm-id']) : null;
   const name = args.name ? String(args.name) : null;
   const context = args.context ? String(args.context) : '';
+  if (args.help) { usage(); return; }
   if (!explicitId && !name) { usage(); fail('Provide --name or both --osm-type and --osm-id'); }
+  if (explicitType && explicitType !== 'relation' && explicitType !== 'way') fail('--osm-type must be relation or way');
   await fs.mkdir(outputDir, { recursive: true });
 
   let discovery = null;
@@ -244,8 +282,8 @@ async function main() {
     discovery = { url: url.toString(), query, candidates: response.json, responseSha256: sha256(response.text) };
     const candidate = response.json.find((item) => {
       const label = `${item.category ?? item.class ?? ''} ${item.type ?? ''}`;
-      return (item.name === name || item.display_name?.startsWith(`${name},`)) && (item.osm_type === 'relation' || item.osm_type === 'way') && label.includes('boundary');
-    }) ?? response.json.find((item) => item.osm_type === 'relation' || item.osm_type === 'way');
+      return (item.name === name || item.display_name?.startsWith(`${name},`)) && (item.osm_type === 'relation' || item.osm_type === 'way') && (label.includes('boundary') || label.includes('administrative'));
+    });
     if (!candidate) fail(`No OSM boundary candidate found for ${query}`);
     osmType = candidate.osm_type;
     osmId = String(candidate.osm_id);
@@ -253,37 +291,73 @@ async function main() {
 
   const apiType = osmType === 'relation' ? 'relation' : 'way';
   const objectUrl = `https://api.openstreetmap.org/api/0.6/${apiType}/${osmId}/full.json`;
-  const fetched = await fetchJson(objectUrl);
+  const stem = `${osmType === 'relation' ? 'R' : 'W'}${osmId}`;
+  let priorMetadata = null;
+  if (args['reuse-cache']) {
+    try {
+      priorMetadata = JSON.parse(await fs.readFile(path.join(outputDir, `${stem}.metadata.json`), 'utf8'));
+    } catch (error) {
+      if (error.code !== 'ENOENT') priorMetadata = null;
+    }
+  }
+  const kind = args.kind ? String(args.kind) : priorMetadata?.kind ?? 'boundary';
+  const resolvedContext = context || priorMetadata?.context || '';
+  const boundaryDefinition = args['boundary-definition'] ? String(args['boundary-definition']) : priorMetadata?.boundaryDefinition ?? null;
+  const priorReferenceArea = priorMetadata?.referenceComparison?.referenceAreaKm2;
+  const referenceAreaKm2 = args['reference-area-km2'] ? Number(args['reference-area-km2']) : (Number.isFinite(priorReferenceArea) ? priorReferenceArea : null);
+  const rawCachePath = path.join(outputDir, `${stem}.osm-full.json`);
+  let fetched;
+  let fromCache = false;
+  if (args['reuse-cache']) {
+    try {
+      const text = await fs.readFile(rawCachePath, 'utf8');
+      fetched = { text, json: JSON.parse(text) };
+      fromCache = true;
+    } catch (error) {
+      if (error.code !== 'ENOENT') fetched = null;
+    }
+  }
+  if (!fetched) fetched = await fetchJson(objectUrl);
   const built = apiType === 'relation' ? relationGeometry(fetched.json, osmId) : wayGeometry(fetched.json, osmId);
   const geometry = built.geometry;
   const bbox = bboxOf(geometry);
+  if (!coordinatesAreValid(geometry)) fail('Geometry contains invalid or out-of-range coordinates');
+  if (bbox[2] - bbox[0] > 180) fail('Antimeridian-crossing geometry requires an antimeridian-aware transform; refusing an incorrect ratio');
+  if (bbox[3] <= bbox[1]) fail('Geometry has no positive latitude span');
   const areaKm2 = sphericalAreaKm2(geometry);
   const centerLat = (bbox[1] + bbox[3]) / 2;
   const projectedAspectRatio = ((bbox[2] - bbox[0]) * Math.cos(centerLat * Math.PI / 180)) / (bbox[3] - bbox[1]);
   const rasterWidth = projectedAspectRatio >= 1 ? 2048 : Math.max(1, Math.round(2048 * projectedAspectRatio));
   const rasterHeight = projectedAspectRatio >= 1 ? Math.max(1, Math.round(2048 / projectedAspectRatio)) : 2048;
   const rings = allRings(geometry);
-  const stem = `${osmType === 'relation' ? 'R' : 'W'}${osmId}`;
   const deepChecks = args.deep ? { selfIntersectionCount: rings.reduce((sum, ring) => sum + selfIntersectionCount(ring), 0) } : null;
   if (deepChecks && deepChecks.selfIntersectionCount > 0) fail(`Self-intersections found: ${deepChecks.selfIntersectionCount}`);
-  const geojson = { type: 'Feature', properties: { name: name ?? built.relation?.tags?.name ?? `${osmType}:${osmId}`, osmType, osmId: Number(osmId), boundarySourceUrl: `https://www.openstreetmap.org/${osmType}/${osmId}`, license: 'OpenStreetMap contributors, ODbL 1.0' }, geometry };
+  const resolvedName = name ?? priorMetadata?.name ?? built.relation?.tags?.name ?? `${osmType}:${osmId}`;
+  const areaRatio = Number.isFinite(referenceAreaKm2) && referenceAreaKm2 > 0 ? areaKm2 / referenceAreaKm2 : null;
+  const areaDifferencePercent = areaRatio == null ? null : (areaRatio - 1) * 100;
+  const geojson = { type: 'Feature', properties: { name: resolvedName, kind, context: resolvedContext, boundaryDefinition, osmType, osmId: Number(osmId), boundarySourceUrl: `https://www.openstreetmap.org/${osmType}/${osmId}`, license: 'OpenStreetMap contributors, ODbL 1.0' }, geometry };
   await fs.writeFile(path.join(outputDir, `${stem}.geojson`), `${JSON.stringify(geojson, null, 2)}\n`, 'utf8');
   if (!args['no-svg']) {
     const padding = Math.max(bbox[2] - bbox[0], bbox[3] - bbox[1]) * 0.04;
     await fs.writeFile(path.join(outputDir, `${stem}.preview.svg`), svgText(geometry, bbox, rasterWidth, rasterHeight, padding), 'utf8');
   }
-  if (args['keep-raw']) await fs.writeFile(path.join(outputDir, `${stem}.osm-full.json`), fetched.text, 'utf8');
+  if (args['keep-raw'] || args['reuse-cache']) await fs.writeFile(rawCachePath, fetched.text, 'utf8');
   const metadata = {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
-    source: { osmType, osmId: Number(osmId), objectUrl, responseSha256: sha256(fetched.text), discovery },
+    name: resolvedName,
+    kind,
+    context: resolvedContext,
+    boundaryDefinition,
+    source: { osmType, osmId: Number(osmId), objectUrl, responseSha256: sha256(fetched.text), discovery, fromCache, rawResponseFile: (args['keep-raw'] || args['reuse-cache']) ? `${stem}.osm-full.json` : null },
     geometry: { type: geometry.type, bbox, areaKm2: Number(areaKm2.toFixed(8)), vertexCount: rings.reduce((sum, ring) => sum + ring.length, 0), ringCount: rings.length },
+    referenceComparison: { referenceAreaKm2: Number.isFinite(referenceAreaKm2) ? referenceAreaKm2 : null, areaRatio, areaDifferencePercent },
     export: { svg: args['no-svg'] ? null : { file: `${stem}.preview.svg`, aspectRatio: Number(projectedAspectRatio.toFixed(8)), projection: 'local equirectangular, one x/y scale' }, pngMask: { recommendedWidth: rasterWidth, recommendedHeight: rasterHeight, aspectRatio: Number(projectedAspectRatio.toFixed(8)), rendered: false } },
     validation: { status: 'passed', checks: ['GeoJSON structure', 'closed rings', 'coordinate range', 'outer/inner assignment', 'aspect-preserving dimensions'], deepChecksRequested: Boolean(args.deep), deepChecks },
     files: { geojson: `${stem}.geojson`, metadata: `${stem}.metadata.json`, previewSvg: args['no-svg'] ? null : `${stem}.preview.svg` },
   };
   await fs.writeFile(path.join(outputDir, `${stem}.metadata.json`), `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
-  console.log(JSON.stringify({ osm: `${osmType}:${osmId}`, geometry: geometry.type, areaKm2: Number(areaKm2.toFixed(6)), aspectRatio: Number(projectedAspectRatio.toFixed(6)), outputDir }, null, 2));
+  console.log(JSON.stringify({ osm: `${osmType}:${osmId}`, geometry: geometry.type, areaKm2: Number(areaKm2.toFixed(6)), aspectRatio: Number(projectedAspectRatio.toFixed(6)), fromCache, outputDir }, null, 2));
 }
 
 main().catch((error) => { console.error(error.stack || error.message || String(error)); process.exitCode = 1; });
