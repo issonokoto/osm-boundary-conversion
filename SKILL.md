@@ -1,6 +1,6 @@
 ---
 name: osm-boundary-conversion
-description: Resolve and verify OSM-derived boundaries for islands, lakes, parks, administrative areas, and site footprints, then preserve canonical GeoJSON plus metadata and export-ready specifications for SVG, PNG masks, raster tiles, KML, or other image/data outputs. Use when a boundary must be selected from OSM, Nominatim, or Overpass, reconstructed from relations, checked against place/area/context, converted, or saved into a project catalog.
+description: Resolve and verify OSM-derived boundaries for islands, lakes, linear water features, parks, administrative areas, and site footprints, then preserve canonical GeoJSON plus metadata and export-ready specifications for SVG, PNG masks, raster tiles, KML, or other image/data outputs. Use when a boundary or named feature must be selected from OSM, Nominatim, or Overpass, reconstructed from relations, checked against place/area/context, converted, or saved into a project catalog.
 ---
 
 # OSM Boundary Conversion
@@ -16,7 +16,7 @@ Use a verified vector boundary as the source of truth and derive images or other
 Before querying OSM, record:
 
 - target feature and aliases;
-- boundary kind: island/landmass, lake or water surface, park, administrative area, facility footprint, or another explicitly named concept;
+- boundary kind: island/landmass, lake or water surface, linear water feature, park, administrative area, facility footprint, or another explicitly named concept;
 - whether surrounding water, territorial waters, enclaves, islands, and holes are included;
 - geographic context and an expected order of magnitude for area;
 - required output formats, coordinate reference system, image dimensions, and whether exact georeferencing is required.
@@ -33,7 +33,7 @@ Use the direct Nominatim/OSM HTTP endpoints for this workflow. Do not use generi
 
 Typical tags to inspect include `type=multipolygon`, `boundary=administrative`, `natural=coastline`, `natural=water`, `water=lake`, `type=strait`, `place=island`, `leisure=park`, and the feature's local name tags. Tags are evidence, not a substitute for checking the actual geometry and intended definition.
 
-The bundled converter recognizes both administrative and natural-feature candidates. Use `--kind administrative-area`, `--kind island`, `--kind water`, or `--kind park` when the intended boundary is known. Without `--kind`, it infers a supported kind from the Nominatim category/type and still stops on tied candidates instead of choosing the first same-name result.
+The bundled converter recognizes both administrative and natural-feature candidates. Use `--kind administrative-area`, `--kind island`, `--kind water` (or a water subtype such as `lake`, `strait`, `river`, or `bay`), or `--kind park` when the intended boundary is known. Without `--kind`, it infers a supported kind from the Nominatim category/type and still stops on tied candidates instead of choosing the first same-name result.
 
 Use a fast path when a verified `osmType` and `osmId` are already available: skip Nominatim name search, fetch the complete pinned object once, and validate the result locally. Treat alternate geometries such as Geolonia, Natural Earth, or WDPA as optional comparisons, not required steps on every run. Put a bounded timeout on network requests, avoid unbounded retry/sleep loops, and reuse a local response cache when the source revision has not changed.
 
@@ -43,7 +43,7 @@ Use three execution modes:
 - **Deep (opt-in):** official-area lookup, alternate-source comparison, PNG preview, or visual inspection only when the user requests it, the quick checks are ambiguous, or the feature is unusually complex.
 - **Fallback:** if a bounded request fails or exceeds its timeout, stop that request, report the exact stage, and use a documented alternate source only when appropriate. Do not silently start a long chain of retries.
 
-For a new name-based request, use a total network budget of roughly 45 seconds: one discovery request and one full-object request, with at most one bounded retry for a transient failure. Once an ID is fixed, never repeat discovery for the same run.
+For a new name-based request, use a total network budget of roughly 45 seconds: one discovery request and one full-object request, with at most one bounded retry for a transient failure. Once an ID is fixed, never repeat discovery for the same run. Do not hardcode a city, island, water body, OSM ID, area, or special-case correction into the workflow; the same candidate, context, kind, and geometry checks must work for any place.
 
 When this skill folder contains `scripts/convert_osm_boundary.mjs`, use that bundled converter first instead of writing a new boundary-assembly script. Typical commands are:
 
@@ -52,10 +52,14 @@ node scripts/convert_osm_boundary.mjs --name "豊中市" --context "大阪府 �
 node scripts/convert_osm_boundary.mjs --osm-type relation --osm-id 358672 --name "豊中市" --output-dir outputs
 node scripts/convert_osm_boundary.mjs --name "淡路島" --kind island --context "兵庫県 日本" --output-dir outputs
 node scripts/convert_osm_boundary.mjs --name "琵琶湖" --kind water --context "滋賀県 日本" --output-dir outputs
+node scripts/convert_osm_boundary.mjs --name "明石海峡" --kind water --context "兵庫県 日本" --output-dir outputs
+node scripts/convert_osm_boundary.mjs --osm-type way --osm-id 1442885134 --name "明石海峡" --kind water --output-dir outputs
 node scripts/convert_osm_boundary.mjs --osm-type relation --osm-id 358672 --output-dir outputs --reuse-cache
 ```
 
-The bundled converter performs the bounded HTTP requests, relation/way assembly, GeoJSON save, metadata save, and aspect-preserving SVG specification. `--reuse-cache` reuses a previously saved full OSM response for same-ID regeneration; omit it when a fresh source revision is required. Use `--deep` only when deeper checks are requested or the quick result is ambiguous; do not reimplement its core algorithm in the task workspace.
+The bundled converter performs the bounded HTTP requests, relation/way assembly, GeoJSON save, metadata save, and aspect-preserving SVG/export specification. `--reuse-cache` reuses a previously saved full OSM response for same-ID regeneration; omit it when a fresh source revision is required. Use `--deep` only when deeper checks are requested or the quick result is ambiguous; do not reimplement its core algorithm in the task workspace. A closed way or relation becomes a `Polygon`/`MultiPolygon`; an open way is preserved as a `LineString` with a line preview and an explicit `pngMask.supported=false` record. It is never silently closed into an invented area.
+
+When a request names several nearby features, create one target entry per intended feature (name, kind, context, and optional verified OSM ID), resolve and save each independently, and write a small manifest linking the entries. Keep the city/administrative area, each island, and each water feature as separate objects unless the user explicitly requests a union. A failed or rejected candidate must remain visible in the manifest; do not silently substitute a same-name feature or merge a surrounding water body into a land boundary.
 
 ### 3. Select and pin the correct OSM object
 
@@ -72,7 +76,7 @@ Accept only a candidate that passes the checks. Store the stable `osmType` and `
 
 ### 4. Fetch and normalize complete geometry
 
-For a relation, fetch the full relation and its members, preserve `outer` and `inner` roles, and reconstruct the multipolygon from complete ways. For a way, require a closed polygon with matching first and last node IDs; never auto-close a linear feature such as a named strait. A recognized water feature may still be line-only and therefore unsuitable for an area mask. Never use a bounding box or a simplified search preview as the final boundary.
+For a relation, fetch the full relation and its members, preserve `outer` and `inner` roles, and reconstruct the multipolygon from complete ways. For a closed way, require matching first and last node IDs. For an open way, preserve the ordered nodes as a `LineString`; never auto-close a linear feature such as a named strait. A recognized water feature may therefore be either an area or a line: the former can produce an area mask, while the latter gets a canonical line GeoJSON/SVG and an explicit no-mask status. Never use a bounding box or a simplified search preview as the final geometry.
 
 Normalize all coordinates to GeoJSON order `[longitude, latitude]`. Handle antimeridian crossings deliberately, preserve holes, remove only exact duplicate consecutive points, and keep enough vertices for the intended scale. Do not simplify before the unsimplified geometry has been saved or checksummed.
 
@@ -83,7 +87,7 @@ For large or complex relations that time out or return an unusable polygon, try 
 Run checks appropriate to the feature and output scale:
 
 - valid JSON and GeoJSON structure;
-- `Polygon` or `MultiPolygon` geometry with non-empty, closed rings;
+- `Polygon` or `MultiPolygon` geometry with non-empty, closed rings, or a `LineString` whose ordered nodes are preserved;
 - correct outer/inner winding or library-normalized winding;
 - no self-intersections, broken relation joins, accidental duplicate rings, or holes outside their outer ring;
 - plausible bounding box, centroid, and coordinate range;
@@ -134,8 +138,9 @@ For Dokodemo Nauru, inspect the current nested `github-dokodemo-nauru` repositor
 
 Treat GeoJSON or another validated vector as canonical; never make a screenshot the only saved boundary. For each derivative, save the transform specification with the output:
 
-- **SVG:** choose a projection or planar transform, map the target bounds to the viewBox, preserve holes as subpaths, and document whether y-axis inversion was applied.
+- **SVG:** choose a projection or planar transform, map the target bounds to the viewBox, preserve holes as subpaths, and document whether y-axis inversion was applied. For a `LineString`, emit a stroked path without closing it.
 - **PNG/TIFF mask:** choose width, height, bounds, background, fill/alpha convention, antialiasing, and pixel-to-coordinate transform. Use transparency or a documented mask value outside the boundary. If exact geographic placement is needed, use GeoTIFF or a world-file/sidecar rather than an unreferenced PNG.
+  An open `LineString` is not an area mask; keep the vector and line preview and report that a mask is unsupported unless a separately verified closed water boundary is selected.
 - **Raster tiles or MBTiles:** record zoom range, tile scheme, projection, source geometry version, and simplification rule.
 - **KML, GeoPackage, TopoJSON, or other formats:** preserve CRS, holes, feature identity, attribution, and the conversion tool/version.
 
@@ -164,7 +169,7 @@ Return a compact receipt containing the accepted OSM object, rejected or ambiguo
 
 - **Same-name wrong object:** repeat with context, coordinates, aliases, and explicit OSM IDs; reject the result instead of accepting the first polygon.
 - **Water or island is not recognized:** check the Nominatim `category`/`type` (`water`/`lake`, `place`/`island`) and retry with `--kind water` or `--kind island`; do not require `boundary=administrative` for natural features.
-- **Named water feature is a line:** keep the `natural=strait`/other linear OSM object as a water feature, but reject it for polygon conversion unless a closed area relation/way is separately verified; never turn an open way into a fake triangle by adding its first point.
+- **Named water feature is a line:** keep the `natural=strait`/other linear OSM object as a `LineString`, emit its GeoJSON and line preview, and mark area-mask export unsupported. If a filled water surface is required, select a separately verified closed area relation/way; never turn an open way into a fake triangle by adding its first point.
 - **Island includes a country or territorial water:** inspect tags and area definition, compare the shape with a trusted reference, and choose a landmass relation or documented alternate source.
 - **Lake or park is missing or split:** query `natural=water`, `water=*`, relation members, and nearby coordinates; keep separate features separate unless the requested definition is a group boundary.
 - **Relation/API timeout:** retry a bounded endpoint/query with backoff, then document a fallback; do not silently replace the source.
