@@ -48,9 +48,10 @@ When this skill folder contains `scripts/convert_osm_boundary.mjs`, use that bun
 ```text
 node scripts/convert_osm_boundary.mjs --name "豊中市" --context "大阪府 日本" --output-dir outputs
 node scripts/convert_osm_boundary.mjs --osm-type relation --osm-id 358672 --name "豊中市" --output-dir outputs
+node scripts/convert_osm_boundary.mjs --osm-type relation --osm-id 358672 --output-dir outputs --reuse-cache
 ```
 
-The bundled converter performs the bounded HTTP requests, relation/way assembly, GeoJSON save, metadata save, and aspect-preserving SVG specification. Use `--deep` only when deeper checks are requested or the quick result is ambiguous; do not reimplement its core algorithm in the task workspace.
+The bundled converter performs the bounded HTTP requests, relation/way assembly, GeoJSON save, metadata save, and aspect-preserving SVG specification. `--reuse-cache` reuses a previously saved full OSM response for same-ID regeneration; omit it when a fresh source revision is required. Use `--deep` only when deeper checks are requested or the quick result is ambiguous; do not reimplement its core algorithm in the task workspace.
 
 ### 3. Select and pin the correct OSM object
 
